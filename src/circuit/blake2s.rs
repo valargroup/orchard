@@ -433,11 +433,11 @@ impl<F: PrimeField> Blake2sConfig<F> {
 
             // Constraint 1: bit_255 must be 0
             // (bit_255 is already boolean from s_byte_decompose, just constrain to 0)
-            let bit_255_zero = bit_255.clone();
+            let bit_255_zero = bit_255;
 
             // Constraint 2: If bit_254 = 1, then sum_bits_253_to_128 must be 0
             // This ensures bits 253-128 are all zero when bit 254 is set
-            let high_bits_zero_when_needed = bit_254.clone() * sum_bits_253_to_128.clone();
+            let high_bits_zero_when_needed = bit_254.clone() * sum_bits_253_to_128;
 
             // Constraint 3: lower_128_lt must be boolean
             let lower_128_lt_bool = bool_check(lower_128_lt.clone());
@@ -449,20 +449,20 @@ impl<F: PrimeField> Blake2sConfig<F> {
             // When bit_254 = 0, lower_128_lt is unconstrained (don't care)
             // When bit_254 = 1, lower_128_lt must be 1 and diff must be valid
             let diff_check = bit_254.clone()
-                * (lower_128_diff.clone() - (p_lower.clone() - lower_128.clone() - one.clone()));
+                * (lower_128_diff.clone() - (p_lower - lower_128 - one.clone()));
 
             // Constraint 5: Verify lower_128_diff decomposes correctly into 4 words
             // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
             // diff = diff_word_1 + diff_word_2 * 2^32 + diff_word_3 * 2^64 + diff_word_4 * 2^96
             let diff_decomposition = bit_254.clone()
-                * (lower_128_diff.clone()
-                    - diff_word_1.clone()
-                    - diff_word_2.clone() * two_32.clone()
-                    - diff_word_3.clone() * F::from_u128(1u128 << 64)
-                    - diff_word_4.clone() * F::from_u128(1u128 << 96));
+                * (lower_128_diff
+                    - diff_word_1
+                    - diff_word_2 * two_32
+                    - diff_word_3 * F::from_u128(1u128 << 64)
+                    - diff_word_4 * F::from_u128(1u128 << 96));
 
             // Constraint 6: When bit_254 = 1, lower_128_lt must be 1
-            let must_be_less_when_254_set = bit_254.clone() * (lower_128_lt.clone() - one.clone());
+            let must_be_less_when_254_set = bit_254 * (lower_128_lt - one);
 
             // Constraint 7: Final validity - either bit_254 = 0 (automatically valid)
             // or bit_254 = 1 with all checks passing

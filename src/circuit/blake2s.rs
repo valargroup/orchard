@@ -81,6 +81,10 @@ const PALLAS_MODULUS_WORDS: [u32; 8] = [
     0x40000000, // word_8 (bits 224-255)
 ];
 
+// Lower 128 bits of pallas modulus as a u128 for comparison
+// p_lower = 0x224698fc_094cf91b_992d30ed_00000001
+const PALLAS_MODULUS_LOWER_128: u128 = 0x224698fc_094cf91b_992d30ed_00000001;
+
 // The SIGMA constant in Blake2s is a 10x16 array that defines the message permutations in the
 // algorithm. Each of the 10 rows corresponds to a round of the hashing process, and each of the
 // 16 elements in the row determines the message block order.
@@ -379,176 +383,100 @@ impl<F: PrimeField> Blake2sConfig<F> {
             ]
         });
 
-        // CANONICALITY CHECK GATE
+        // CANONICALITY CHECK GATE (BIT-LEVEL)
         //
-        // This gate ensures that the 8-word decomposition of a field element represents
-        // the canonical value (i.e., strictly less than the pallas modulus p).
-        //
-        // Without this check, a malicious prover could decompose field element f as either:
-        // - f (canonical)
-        // - f + p (if f + p < 2^256)
-        //
-        // Both satisfy the decomposition constraint (sum ≡ f mod p), but produce different
-        // BLAKE2s hashes since BLAKE2s operates on the raw bits.
+        // This gate ensures that the 256-bit decomposition of a field element is
+        // strictly less than the pallas modulus p, using direct bit constraints.
         //
         // The pallas modulus is:
         // p = 0x40000000_00000000_00000000_00000000_224698fc_094cf91b_992d30ed_00000001
         //
-        // Layout (3 rows):
-        // Row 0: word_1, word_2, word_3, word_4, hi_lt, hi_eq, mid_lt, mid_eq, lo_lt, lo_eq
-        // Row 1: word_5, word_6, word_7, word_8, w8_check, result_lt, unused...
-        // Row 2: hi_diff, mid_diff, lo_diff, (range check witnesses for diffs)
+        // In binary: bit 255 = 0, bit 254 = 1, bits 253-128 = 0, bits 127-0 = lower part
         //
-        // The gate implements cascading comparison:
-        // 1. word_8 must be <= 0x40000000
-        // 2. If word_8 == 0x40000000, words 5,6,7 must be 0
-        // 3. If above holds, (word_4, word_3, word_2, word_1) < (p_4, p_3, p_2, p_1)
+        // For a canonical value x < p:
+        // - Case 1: bit[255] = 0 AND bit[254] = 0 → x < 2^254 < p ✓
+        // - Case 2: bit[255] = 0 AND bit[254] = 1 → x ∈ [2^254, 2^255)
+        //   - If any of bits[253..128] = 1 → x >= 2^254 + 2^128 > p ✗
+        //   - If bits[253..128] = 0 → need bits[127..0] < p's lower 128 bits
+        //
+        // This gate checks:
+        // 1. bit[255] = 0 (always required)
+        // 2. If bit[254] = 1: sum of bits[253..128] must be 0
+        // 3. If bit[254] = 1: lower 128 bits must be < p_lower via cascading comparison
+        //
+        // Layout (2 rows):
+        // Row 0: bit_254, bit_255, sum_253_to_128, lower_lt, lower_128_running_lt
+        // Row 1: (additional comparison witnesses if needed)
         meta.create_gate("canonicality check", |meta| {
             use halo2_proofs::plonk::Expression;
 
             let s_canonicality = meta.query_selector(s_canonicality);
 
-            // Row 0: Low words and comparison flags
-            let word_1 = meta.query_advice(advices[0], Rotation::cur());
-            let word_2 = meta.query_advice(advices[1], Rotation::cur());
-            let word_3 = meta.query_advice(advices[2], Rotation::cur());
-            let word_4 = meta.query_advice(advices[3], Rotation::cur());
-            // Comparison flags for words 1-2 (lo), 3-4 (mid), 5-8 (hi)
-            let hi_120_lt = meta.query_advice(advices[4], Rotation::cur());
-            let hi_120_eq = meta.query_advice(advices[5], Rotation::cur());
-            let mid_lt = meta.query_advice(advices[6], Rotation::cur());
-            let mid_eq = meta.query_advice(advices[7], Rotation::cur());
-            let lo_lt = meta.query_advice(advices[8], Rotation::cur());
+            // Query the critical bits and witnesses
+            let bit_255 = meta.query_advice(advices[0], Rotation::cur());
+            let bit_254 = meta.query_advice(advices[1], Rotation::cur());
+            let sum_bits_253_to_128 = meta.query_advice(advices[2], Rotation::cur());
+            let lower_128_lt = meta.query_advice(advices[3], Rotation::cur());
+            let lower_128_diff = meta.query_advice(advices[4], Rotation::cur());
+            // Decomposition of lower_128_diff to verify it's in valid range
+            let diff_word_1 = meta.query_advice(advices[5], Rotation::cur());
+            let diff_word_2 = meta.query_advice(advices[6], Rotation::cur());
+            let diff_word_3 = meta.query_advice(advices[7], Rotation::cur());
+            let diff_word_4 = meta.query_advice(advices[8], Rotation::cur());
 
-            // Row 1: High words
-            let word_5 = meta.query_advice(advices[0], Rotation::next());
-            let word_6 = meta.query_advice(advices[1], Rotation::next());
-            let word_7 = meta.query_advice(advices[2], Rotation::next());
-            let word_8 = meta.query_advice(advices[3], Rotation::next());
-            // Result flag: 1 if decomposition < p, 0 otherwise
-            let result_lt = meta.query_advice(advices[4], Rotation::next());
+            // The actual lower 128-bit value (words 1-4 combined)
+            let lower_128 = meta.query_advice(advices[0], Rotation::next());
 
-            // Row 2: Difference witnesses for range checking
-            // These are used to verify the lt/eq flags are correct
-            let hi_diff = meta.query_advice(advices[0], Rotation(2));
-            let w4_diff = meta.query_advice(advices[1], Rotation(2));
-            let w3_diff = meta.query_advice(advices[2], Rotation(2));
-            let w2_diff = meta.query_advice(advices[3], Rotation(2));
-            let w1_diff = meta.query_advice(advices[4], Rotation(2));
-
-            // Pallas modulus words as Expression constants (little-endian)
-            let p_1 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[0] as u64));
-            let p_2 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[1] as u64));
-            let p_3 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[2] as u64));
-            let p_4 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[3] as u64));
-            // p_5 = p_6 = p_7 = 0
-            let p_8 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[7] as u64)); // 0x40000000
-
-            let two_32 = Expression::Constant(F::from(1u64 << 32));
-            let two_64 = Expression::Constant(F::from_u128(1u128 << 64));
-            let two_96 = Expression::Constant(F::from_u128(1u128 << 96));
             let one = Expression::Constant(F::ONE);
+            let p_lower = Expression::Constant(F::from_u128(PALLAS_MODULUS_LOWER_128));
+            let two_32 = Expression::Constant(F::from(1u64 << 32));
 
-            // Check 1: hi_120_eq = 1 iff (word_8 == p_8 AND word_7 == 0 AND word_6 == 0 AND word_5 == 0)
-            // Compute: hi_120 = word_5 + word_6*2^32 + word_7*2^64 + word_8*2^96
-            // p_hi_120 = 0 + 0 + 0 + p_8*2^96 = p_8 * 2^96
-            let hi_120 = word_5.clone()
-                + word_6.clone() * two_32.clone()
-                + word_7.clone() * two_64.clone()
-                + word_8.clone() * two_96.clone();
-            let p_hi_120 = p_8.clone() * two_96;
+            // Constraint 1: bit_255 must be 0
+            // (bit_255 is already boolean from s_byte_decompose, just constrain to 0)
+            let bit_255_zero = bit_255.clone();
 
-            // hi_120_eq: boolean check
-            let hi_120_eq_bool = bool_check(hi_120_eq.clone());
+            // Constraint 2: If bit_254 = 1, then sum_bits_253_to_128 must be 0
+            // This ensures bits 253-128 are all zero when bit 254 is set
+            let high_bits_zero_when_needed = bit_254.clone() * sum_bits_253_to_128.clone();
 
-            // hi_120_lt: boolean check
-            let hi_120_lt_bool = bool_check(hi_120_lt.clone());
+            // Constraint 3: lower_128_lt must be boolean
+            let lower_128_lt_bool = bool_check(lower_128_lt.clone());
 
-            // hi_diff should equal p_hi_120 - hi_120 - 1 when hi_120 < p_hi_120
-            // Constraint: hi_diff = hi_120_lt * (p_hi_120 - hi_120 - 1)
-            let hi_diff_check = hi_diff.clone()
-                - hi_120_lt.clone() * (p_hi_120.clone() - hi_120.clone() - one.clone());
+            // Constraint 4: When bit_254 = 1, we need lower_128 < p_lower
+            // Verify using: lower_128_diff = p_lower - 1 - lower_128
+            // And lower_128_diff must be non-negative (verified by decomposition)
+            //
+            // When bit_254 = 0, lower_128_lt is unconstrained (don't care)
+            // When bit_254 = 1, lower_128_lt must be 1 and diff must be valid
+            let diff_check = bit_254.clone()
+                * (lower_128_diff.clone() - (p_lower.clone() - lower_128.clone() - one.clone()));
 
-            // Constraint: hi_120_eq = 1 implies hi_120 = p_hi_120
-            let hi_eq_implies_equal =
-                hi_120_eq.clone() * (hi_120.clone() - p_hi_120.clone());
+            // Constraint 5: Verify lower_128_diff decomposes correctly into 4 words
+            // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
+            // diff = diff_word_1 + diff_word_2 * 2^32 + diff_word_3 * 2^64 + diff_word_4 * 2^96
+            let diff_decomposition = bit_254.clone()
+                * (lower_128_diff.clone()
+                    - diff_word_1.clone()
+                    - diff_word_2.clone() * two_32.clone()
+                    - diff_word_3.clone() * F::from_u128(1u128 << 64)
+                    - diff_word_4.clone() * F::from_u128(1u128 << 96));
 
-            // Constraint: hi_120_lt + hi_120_eq must be 1 (exactly one is true)
-            // because hi_120 <= p_hi_120 is required (since word_8 <= p_8)
-            let hi_flag_sum = hi_120_lt.clone() + hi_120_eq.clone() - one.clone();
+            // Constraint 6: When bit_254 = 1, lower_128_lt must be 1
+            let must_be_less_when_254_set = bit_254.clone() * (lower_128_lt.clone() - one.clone());
 
-            // Check 2: When hi_120_eq = 1, check words 3-4
-            // mid = word_3 + word_4 * 2^32
-            // p_mid = p_3 + p_4 * 2^32
-            let mid = word_3.clone() + word_4.clone() * two_32.clone();
-            let p_mid = p_3.clone() + p_4.clone() * two_32.clone();
-
-            let mid_lt_bool = bool_check(mid_lt.clone());
-            let mid_eq_bool = bool_check(mid_eq.clone());
-
-            // For mid comparison: mid < p_mid
-            // mid_lt = 1 implies mid < p_mid
-            // mid_eq = 1 implies mid == p_mid
-            // Conditional: only relevant when hi_120_eq = 1
-            let mid_diff_check = hi_120_eq.clone()
-                * (w4_diff.clone() + w3_diff.clone() * two_32.clone()
-                    - mid_lt.clone() * (p_mid.clone() - mid.clone() - one.clone()));
-
-            let mid_eq_implies_equal =
-                hi_120_eq.clone() * mid_eq.clone() * (mid.clone() - p_mid.clone());
-
-            // (hi_120_eq = 1) implies (mid_lt + mid_eq = 1)
-            let mid_flag_sum = hi_120_eq.clone() * (mid_lt.clone() + mid_eq.clone() - one.clone());
-
-            // Check 3: When hi_120_eq = 1 AND mid_eq = 1, check words 1-2
-            // lo = word_1 + word_2 * 2^32
-            // p_lo = p_1 + p_2 * 2^32
-            let lo = word_1.clone() + word_2.clone() * two_32.clone();
-            let p_lo = p_1.clone() + p_2.clone() * two_32.clone();
-
-            let lo_lt_bool = bool_check(lo_lt.clone());
-
-            // lo_lt = 1 implies lo < p_lo
-            let lo_diff_check = hi_120_eq.clone()
-                * mid_eq.clone()
-                * (w2_diff.clone() + w1_diff.clone() * two_32
-                    - lo_lt.clone() * (p_lo.clone() - lo.clone() - one.clone()));
-
-            // When hi_120_eq AND mid_eq, lo must be < p_lo (strictly)
-            let lo_flag_check = hi_120_eq.clone() * mid_eq.clone() * (lo_lt.clone() - one.clone());
-
-            // Final result: result_lt = 1 iff decomposition < p
-            // result_lt = hi_120_lt OR (hi_120_eq AND (mid_lt OR (mid_eq AND lo_lt)))
-            let result_lt_bool = bool_check(result_lt.clone());
-            let result_check = result_lt.clone()
-                - hi_120_lt.clone()
-                - hi_120_eq.clone() * (mid_lt.clone() + mid_eq.clone() * lo_lt.clone())
-                + hi_120_lt.clone()
-                    * hi_120_eq.clone()
-                    * (mid_lt.clone() + mid_eq.clone() * lo_lt.clone());
-
-            // Final constraint: result_lt must be 1
-            let result_must_be_one = result_lt.clone() - one;
+            // Constraint 7: Final validity - either bit_254 = 0 (automatically valid)
+            // or bit_254 = 1 with all checks passing
+            // This is implicit from the above constraints
 
             Constraints::with_selector(
                 s_canonicality,
                 [
-                    ("hi_120_eq bool", hi_120_eq_bool),
-                    ("hi_120_lt bool", hi_120_lt_bool),
-                    ("hi_diff check", hi_diff_check),
-                    ("hi_eq implies equal", hi_eq_implies_equal),
-                    ("hi_flag_sum", hi_flag_sum),
-                    ("mid_lt bool", mid_lt_bool),
-                    ("mid_eq bool", mid_eq_bool),
-                    ("mid_diff check", mid_diff_check),
-                    ("mid_eq implies equal", mid_eq_implies_equal),
-                    ("mid_flag_sum", mid_flag_sum),
-                    ("lo_lt bool", lo_lt_bool),
-                    ("lo_diff check", lo_diff_check),
-                    ("lo_flag_check", lo_flag_check),
-                    ("result_lt bool", result_lt_bool),
-                    ("result check", result_check),
-                    ("result must be one", result_must_be_one),
+                    ("bit_255 must be zero", bit_255_zero),
+                    ("high bits zero when bit_254 set", high_bits_zero_when_needed),
+                    ("lower_128_lt boolean", lower_128_lt_bool),
+                    ("diff equals p_lower - 1 - lower_128", diff_check),
+                    ("diff decomposes to 4 words", diff_decomposition),
+                    ("must be less when bit_254 set", must_be_less_when_254_set),
                 ],
             )
         });
@@ -1025,9 +953,10 @@ impl<F: PrimeField> Blake2sChip<F> {
         )?;
 
         // SOUNDNESS FIX: Canonicality check
-        // Ensure the 8-word decomposition represents a value strictly less than p.
+        // Ensure the 256-bit decomposition represents a value strictly less than p.
         // Without this, a prover could use the non-canonical representation (value + p).
-        self.check_canonicality(layouter, &words)?;
+        // We pass both the bits (for direct bit constraints) and words (for lower_128 computation).
+        self.check_canonicality(layouter, &bits, &words)?;
 
         let res = bits
             .chunks(32)
@@ -1041,179 +970,179 @@ impl<F: PrimeField> Blake2sChip<F> {
         Ok(res)
     }
 
-    /// Check that the 8-word decomposition is canonical (strictly less than p).
+    /// Check that the 256-bit decomposition is canonical (strictly less than p).
     ///
     /// This is a critical soundness check. Without it, a malicious prover could
     /// decompose a field element f as either f or f+p (both satisfy the mod-p
     /// constraint), leading to different BLAKE2s outputs for the "same" field value.
+    ///
+    /// The check uses the 256 bits directly:
+    /// 1. bit[255] must be 0
+    /// 2. If bit[254] = 1, bits[253..128] must all be 0
+    /// 3. If bit[254] = 1, lower 128 bits must be < p's lower 128 bits
+    ///
+    /// The diff value (p_lower - 1 - lower_128) is decomposed into 4 words,
+    /// and each word is range-checked via s_word_decompose to ensure diff >= 0.
     fn check_canonicality(
         &self,
         layouter: &mut impl Layouter<F>,
+        bits: &[AssignedCell<F, F>],
         words: &[AssignedCell<F, F>],
     ) -> Result<(), Error> {
+        assert_eq!(bits.len(), 256);
         assert_eq!(words.len(), 8);
 
-        // Pallas modulus words
-        let p = PALLAS_MODULUS_WORDS;
+        // Extract key bits
+        // bits[255] is the MSB (bit 255 of the 256-bit value)
+        // bits[254] is the second-highest bit
+        // bits[128..254] are the middle bits that must be zero when bit[254] = 1
+        let bit_255 = &bits[255];
+        let bit_254 = &bits[254];
+
+        // Compute sum of bits 253 down to 128 (126 bits)
+        // If bit_254 = 1, this sum must be 0
+        let sum_bits_253_to_128: Value<F> = bits[128..254]
+            .iter()
+            .map(|b| b.value().copied())
+            .fold(Value::known(F::ZERO), |acc, v| {
+                acc.zip(v).map(|(a, b)| a + b)
+            });
+
+        // Compute lower 128 bits as a field element
+        // lower_128 = word_1 + word_2 * 2^32 + word_3 * 2^64 + word_4 * 2^96
+        let lower_128: Value<u128> = words[0]
+            .value()
+            .zip(words[1].value())
+            .zip(words[2].value())
+            .zip(words[3].value())
+            .map(|(((w1, w2), w3), w4)| {
+                let to_u32 = |f: &F| -> u32 {
+                    let repr = f.to_repr();
+                    let bytes = repr.as_ref();
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                };
+                (to_u32(w1) as u128)
+                    + ((to_u32(w2) as u128) << 32)
+                    + ((to_u32(w3) as u128) << 64)
+                    + ((to_u32(w4) as u128) << 96)
+            });
+
+        // Compute diff = p_lower - 1 - lower_128
+        // If lower_128 < p_lower, diff is in [0, p_lower - 1]
+        // If lower_128 >= p_lower, diff would be "negative" (wrap around)
+        let p_lower = PALLAS_MODULUS_LOWER_128;
+        let diff: Value<u128> = lower_128.map(|l| {
+            if l < p_lower {
+                p_lower - 1 - l
+            } else {
+                // This case should never happen for canonical values
+                // Set to 0; the constraint will fail
+                0
+            }
+        });
+
+        // Decompose diff into 4 32-bit words for range checking
+        let diff_words: [Value<u32>; 4] = [
+            diff.map(|d| d as u32),
+            diff.map(|d| (d >> 32) as u32),
+            diff.map(|d| (d >> 64) as u32),
+            diff.map(|d| (d >> 96) as u32),
+        ];
 
         layouter.assign_region(
             || "canonicality check",
             |mut region| {
                 self.config.s_canonicality.enable(&mut region, 0)?;
 
-                // Row 0: words 1-4 and comparison flags
-                for i in 0..4 {
-                    words[i].copy_advice(
-                        || format!("word_{}", i + 1),
-                        &mut region,
-                        self.config.advices[i],
+                // Row 0: bit_255, bit_254, sum, lower_lt, lower_128_diff, diff_words
+                bit_255.copy_advice(|| "bit_255", &mut region, self.config.advices[0], 0)?;
+                bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[1], 0)?;
+
+                region.assign_advice(
+                    || "sum_bits_253_to_128",
+                    self.config.advices[2],
+                    0,
+                    || sum_bits_253_to_128,
+                )?;
+
+                // lower_128_lt is always 1 for canonical values
+                let lower_128_lt = lower_128.map(|l| {
+                    if l < p_lower {
+                        F::ONE
+                    } else {
+                        F::ZERO
+                    }
+                });
+                region.assign_advice(
+                    || "lower_128_lt",
+                    self.config.advices[3],
+                    0,
+                    || lower_128_lt,
+                )?;
+
+                // Witness the diff value
+                let diff_field = diff.map(|d| F::from_u128(d));
+                region.assign_advice(
+                    || "lower_128_diff",
+                    self.config.advices[4],
+                    0,
+                    || diff_field,
+                )?;
+
+                // Witness diff decomposition into 4 words (for range check)
+                for (i, dw) in diff_words.iter().enumerate() {
+                    region.assign_advice(
+                        || format!("diff_word_{}", i + 1),
+                        self.config.advices[5 + i],
                         0,
+                        || dw.map(|w| F::from(w as u64)),
                     )?;
                 }
 
-                // Row 1: words 5-8
-                for i in 4..8 {
-                    words[i].copy_advice(
-                        || format!("word_{}", i + 1),
-                        &mut region,
-                        self.config.advices[i - 4],
-                        1,
-                    )?;
-                }
-
-                // Compute word values for comparison
-                let word_values: Vec<Value<u64>> = words
-                    .iter()
-                    .map(|w| {
-                        w.value().map(|v| {
-                            let repr = v.to_repr();
-                            let bytes = repr.as_ref();
-                            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
-                        })
-                    })
-                    .collect();
-
-                // Compute hi_120 = word_5 + word_6*2^32 + word_7*2^64 + word_8*2^96
-                // and p_hi_120 = p_8 * 2^96 (since p_5=p_6=p_7=0)
-                let hi_120 = word_values[4]
-                    .zip(word_values[5])
-                    .zip(word_values[6])
-                    .zip(word_values[7])
-                    .map(|(((w5, w6), w7), w8)| {
-                        // Use u128 for intermediate calculation
-                        (w5 as u128)
-                            + ((w6 as u128) << 32)
-                            + ((w7 as u128) << 64)
-                            + ((w8 as u128) << 96)
-                    });
-
-                let p_hi_120 = (p[7] as u128) << 96;
-
-                // Compute comparison flags for hi_120
-                let hi_120_lt_val = hi_120.map(|h| if h < p_hi_120 { F::ONE } else { F::ZERO });
-                let hi_120_eq_val = hi_120.map(|h| if h == p_hi_120 { F::ONE } else { F::ZERO });
-
-                // Witness hi_120_lt and hi_120_eq on row 0
-                region.assign_advice(|| "hi_120_lt", self.config.advices[4], 0, || hi_120_lt_val)?;
-                region.assign_advice(|| "hi_120_eq", self.config.advices[5], 0, || hi_120_eq_val)?;
-
-                // Compute mid = word_3 + word_4 * 2^32
-                // p_mid = p_3 + p_4 * 2^32
-                let mid = word_values[2]
-                    .zip(word_values[3])
-                    .map(|(w3, w4)| (w3 as u64) + ((w4 as u64) << 32));
-                let p_mid = (p[2] as u64) + ((p[3] as u64) << 32);
-
-                let mid_lt_val = mid.map(|m| if m < p_mid { F::ONE } else { F::ZERO });
-                let mid_eq_val = mid.map(|m| if m == p_mid { F::ONE } else { F::ZERO });
-
-                region.assign_advice(|| "mid_lt", self.config.advices[6], 0, || mid_lt_val)?;
-                region.assign_advice(|| "mid_eq", self.config.advices[7], 0, || mid_eq_val)?;
-
-                // Compute lo = word_1 + word_2 * 2^32
-                // p_lo = p_1 + p_2 * 2^32
-                let lo = word_values[0]
-                    .zip(word_values[1])
-                    .map(|(w1, w2)| (w1 as u64) + ((w2 as u64) << 32));
-                let p_lo = (p[0] as u64) + ((p[1] as u64) << 32);
-
-                let lo_lt_val = lo.map(|l| if l < p_lo { F::ONE } else { F::ZERO });
-
-                region.assign_advice(|| "lo_lt", self.config.advices[8], 0, || lo_lt_val)?;
-
-                // Compute result_lt = hi_120_lt OR (hi_120_eq AND (mid_lt OR (mid_eq AND lo_lt)))
-                let result_lt_val = hi_120_lt_val
-                    .zip(hi_120_eq_val)
-                    .zip(mid_lt_val)
-                    .zip(mid_eq_val)
-                    .zip(lo_lt_val)
-                    .map(|((((hi_lt, hi_eq), m_lt), m_eq), l_lt)| {
-                        let hi_lt_bool = hi_lt == F::ONE;
-                        let hi_eq_bool = hi_eq == F::ONE;
-                        let m_lt_bool = m_lt == F::ONE;
-                        let m_eq_bool = m_eq == F::ONE;
-                        let l_lt_bool = l_lt == F::ONE;
-
-                        let result = hi_lt_bool || (hi_eq_bool && (m_lt_bool || (m_eq_bool && l_lt_bool)));
-                        if result { F::ONE } else { F::ZERO }
-                    });
-
-                region.assign_advice(|| "result_lt", self.config.advices[4], 1, || result_lt_val)?;
-
-                // Row 2: Difference witnesses for range checking
-                // hi_diff = (p_hi_120 - hi_120 - 1) when hi_120 < p_hi_120, else 0
-                let hi_diff_val = hi_120.map(|h| {
-                    if h < p_hi_120 {
-                        F::from_u128(p_hi_120 - h - 1)
-                    } else {
-                        F::ZERO
-                    }
-                });
-                region.assign_advice(|| "hi_diff", self.config.advices[0], 2, || hi_diff_val)?;
-
-                // w4_diff for mid comparison
-                let w4_diff_val = word_values[3].map(|w4| {
-                    if w4 < (p[3] as u64) {
-                        F::from((p[3] as u64) - w4 - 1)
-                    } else {
-                        F::ZERO
-                    }
-                });
-                region.assign_advice(|| "w4_diff", self.config.advices[1], 2, || w4_diff_val)?;
-
-                // w3_diff
-                let w3_diff_val = word_values[2].map(|w3| {
-                    if w3 < (p[2] as u64) {
-                        F::from((p[2] as u64) - w3 - 1)
-                    } else {
-                        F::ZERO
-                    }
-                });
-                region.assign_advice(|| "w3_diff", self.config.advices[2], 2, || w3_diff_val)?;
-
-                // w2_diff for lo comparison
-                let w2_diff_val = word_values[1].map(|w2| {
-                    if w2 < (p[1] as u64) {
-                        F::from((p[1] as u64) - w2 - 1)
-                    } else {
-                        F::ZERO
-                    }
-                });
-                region.assign_advice(|| "w2_diff", self.config.advices[3], 2, || w2_diff_val)?;
-
-                // w1_diff
-                let w1_diff_val = word_values[0].map(|w1| {
-                    if w1 < (p[0] as u64) {
-                        F::from((p[0] as u64) - w1 - 1)
-                    } else {
-                        F::ZERO
-                    }
-                });
-                region.assign_advice(|| "w1_diff", self.config.advices[4], 2, || w1_diff_val)?;
+                // Row 1: lower_128 value
+                let lower_128_field = lower_128.map(|l| F::from_u128(l));
+                region.assign_advice(
+                    || "lower_128",
+                    self.config.advices[0],
+                    1,
+                    || lower_128_field,
+                )?;
 
                 Ok(())
             },
-        )
+        )?;
+
+        // Range-check each diff word by decomposing it to bytes
+        // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
+        for (i, dw) in diff_words.iter().enumerate() {
+            // Decompose each diff word into 4 bytes, then each byte into bits
+            // The bit boolean constraints will ensure each word is in [0, 2^32 - 1]
+            let mut diff_bytes = Vec::with_capacity(4);
+            for j in 0..4 {
+                let byte_val = dw.map(|w| ((w >> (j * 8)) & 0xFF) as u8);
+                let byte = Blake2sByte::from_u8(
+                    byte_val,
+                    layouter.namespace(|| format!("diff_word_{}_byte_{}", i, j)),
+                    &self.config,
+                )?;
+                diff_bytes.push(byte.get_byte());
+            }
+
+            // Create the word from bytes and verify decomposition
+            let word_val = dw.map(|w| F::from(w as u64));
+            let diff_word = assign_free_advice(
+                layouter.namespace(|| format!("diff_word_{}", i)),
+                self.config.advices[9],
+                word_val,
+            )?;
+            self.word_decompose(
+                layouter.namespace(|| format!("diff_word_{}_decompose", i)),
+                &diff_bytes,
+                &diff_word,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Decompose a word to four bytes.

@@ -1,15 +1,18 @@
-//! BLAKE2b circuit implementation for Halo2.
+//! BLAKE2b-256 circuit implementation for Halo2.
 //!
-//! Based on Anoma's BLAKE2s circuit, modified for BLAKE2b:
+//! Based on Anoma's BLAKE2s circuit, modified for BLAKE2b-256:
 //! https://github.com/anoma/taiga/blob/main/taiga_halo2/src/circuit/blake2s.rs
 //!
-//! BLAKE2b parameters:
-//!               | BLAKE2b          |
+//! BLAKE2B-MOD: Configured for 256-bit (32-byte) output to match Orchard's
+//! action hash requirements (ZIP-244).
+//!
+//! BLAKE2b-256 parameters:
+//!               | BLAKE2b-256      |
 //! --------------+------------------+
 //!  Bits in word | w = 64           |
 //!  Rounds in F  | r = 12           |
 //!  Block bytes  | bb = 128         |
-//!  Hash bytes   | 1 <= nn <= 64    |
+//!  Hash bytes   | nn = 32          |
 //!  Key bytes    | 0 <= kk <= 64    |
 //!  Input bytes  | 0 <= ll < 2**128 |
 //! --------------+------------------+
@@ -555,13 +558,13 @@ impl<F: PrimeField> Blake2bChip<F> {
         }
     }
 
-    /// Process the inputs and return the hash result as 8 words.
-    /// BLAKE2B-MOD: Process with 16-byte personalization and 64-byte output.
+    /// Process the inputs and return the hash result as 4 words (256 bits).
+    /// BLAKE2B-MOD: 16-byte personalization and 32-byte output (BLAKE2b-256).
     ///
     /// # Arguments
     /// * `layouter` - The circuit layouter
     /// * `inputs` - The input field elements (must be even length)
-    /// * `personalization` - 16-byte personalization string (was 8 bytes in BLAKE2s)
+    /// * `personalization` - 16-byte personalization string
     pub fn process(
         &self,
         layouter: &mut impl Layouter<F>,
@@ -572,9 +575,9 @@ impl<F: PrimeField> Blake2bChip<F> {
         assert_eq!(personalization.len(), 16);
         assert!(inputs.len() % 2 == 0);
 
-        // Init - BLAKE2B-MOD: 64-byte output length (was 32)
+        // BLAKE2B-MOD: 32-byte output length (BLAKE2b-256 for Orchard compatibility)
         let mut h = vec![
-            Blake2bWord::from_constant_u64(IV[0] ^ 0x01010000 ^ 64, layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[0] ^ 0x01010000 ^ 32, layouter, self)?,
             Blake2bWord::from_constant_u64(IV[1], layouter, self)?,
             Blake2bWord::from_constant_u64(IV[2], layouter, self)?,
             Blake2bWord::from_constant_u64(IV[3], layouter, self)?,
@@ -636,18 +639,19 @@ impl<F: PrimeField> Blake2bChip<F> {
             true,
         )?;
 
-        Ok(h)
+        // BLAKE2B-MOD: Return first 4 words (256 bits) of the 8-word state
+        Ok(h[0..4].to_vec())
     }
 
-    /// BLAKE2B-MOD: Encode the eight 64-bit words to four field elements.
-    /// (was two field elements from eight 32-bit words in BLAKE2s)
+    /// BLAKE2B-MOD: Encode the four 64-bit words to two field elements.
+    /// Each field element holds 128 bits (2 x 64-bit words).
     pub fn encode_result(
         &self,
         layouter: &mut impl Layouter<F>,
         ret: &[Blake2bWord<F>],
-    ) -> Result<[AssignedCell<F, F>; 4], Error> {
+    ) -> Result<[AssignedCell<F, F>; 2], Error> {
         let mut fields = vec![];
-        assert_eq!(ret.len(), 8);
+        assert_eq!(ret.len(), 4);
         // BLAKE2B-MOD: Encode pairs of 64-bit words (128 bits) per field
         for words in ret.chunks(2) {
             let field = layouter.assign_region(
@@ -681,7 +685,7 @@ impl<F: PrimeField> Blake2bChip<F> {
             )?;
             fields.push(field);
         }
-        assert_eq!(fields.len(), 4);
+        assert_eq!(fields.len(), 2);
         Ok(fields.try_into().unwrap())
     }
 

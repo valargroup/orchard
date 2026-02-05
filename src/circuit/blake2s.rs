@@ -67,6 +67,20 @@ const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
+// Pallas modulus words (little-endian, word_1 is least significant):
+// p = 0x40000000_00000000_00000000_00000000_224698fc_094cf91b_992d30ed_00000001
+// This is used for canonicality checks to ensure field decomposition is unique.
+const PALLAS_MODULUS_WORDS: [u32; 8] = [
+    0x00000001, // word_1 (bits 0-31)
+    0x992d30ed, // word_2 (bits 32-63)
+    0x094cf91b, // word_3 (bits 64-95)
+    0x224698fc, // word_4 (bits 96-127)
+    0x00000000, // word_5 (bits 128-159)
+    0x00000000, // word_6 (bits 160-191)
+    0x00000000, // word_7 (bits 192-223)
+    0x40000000, // word_8 (bits 224-255)
+];
+
 // The SIGMA constant in Blake2s is a 10x16 array that defines the message permutations in the
 // algorithm. Each of the 10 rows corresponds to a round of the hashing process, and each of the
 // 16 elements in the row determines the message block order.
@@ -117,6 +131,8 @@ pub struct Blake2sConfig<F: PrimeField> {
     pub s_word_add: Selector,
     /// Selector for result encoding gate.
     pub s_result_encode: Selector,
+    /// Selector for canonicality check gate (ensures field decomposition < p).
+    pub s_canonicality: Selector,
     _marker: PhantomData<F>,
 }
 
@@ -223,6 +239,7 @@ impl<F: PrimeField> Blake2sConfig<F> {
         let s_byte_xor = meta.selector();
         let s_word_add = meta.selector();
         let s_result_encode = meta.selector();
+        let s_canonicality = meta.selector();
 
         meta.create_gate("decompose field to words", |meta| {
             let field_element = meta.query_advice(advices[0], Rotation::next());
@@ -362,6 +379,180 @@ impl<F: PrimeField> Blake2sConfig<F> {
             ]
         });
 
+        // CANONICALITY CHECK GATE
+        //
+        // This gate ensures that the 8-word decomposition of a field element represents
+        // the canonical value (i.e., strictly less than the pallas modulus p).
+        //
+        // Without this check, a malicious prover could decompose field element f as either:
+        // - f (canonical)
+        // - f + p (if f + p < 2^256)
+        //
+        // Both satisfy the decomposition constraint (sum ≡ f mod p), but produce different
+        // BLAKE2s hashes since BLAKE2s operates on the raw bits.
+        //
+        // The pallas modulus is:
+        // p = 0x40000000_00000000_00000000_00000000_224698fc_094cf91b_992d30ed_00000001
+        //
+        // Layout (3 rows):
+        // Row 0: word_1, word_2, word_3, word_4, hi_lt, hi_eq, mid_lt, mid_eq, lo_lt, lo_eq
+        // Row 1: word_5, word_6, word_7, word_8, w8_check, result_lt, unused...
+        // Row 2: hi_diff, mid_diff, lo_diff, (range check witnesses for diffs)
+        //
+        // The gate implements cascading comparison:
+        // 1. word_8 must be <= 0x40000000
+        // 2. If word_8 == 0x40000000, words 5,6,7 must be 0
+        // 3. If above holds, (word_4, word_3, word_2, word_1) < (p_4, p_3, p_2, p_1)
+        meta.create_gate("canonicality check", |meta| {
+            use halo2_proofs::plonk::Expression;
+
+            let s_canonicality = meta.query_selector(s_canonicality);
+
+            // Row 0: Low words and comparison flags
+            let word_1 = meta.query_advice(advices[0], Rotation::cur());
+            let word_2 = meta.query_advice(advices[1], Rotation::cur());
+            let word_3 = meta.query_advice(advices[2], Rotation::cur());
+            let word_4 = meta.query_advice(advices[3], Rotation::cur());
+            // Comparison flags for words 1-2 (lo), 3-4 (mid), 5-8 (hi)
+            let hi_120_lt = meta.query_advice(advices[4], Rotation::cur());
+            let hi_120_eq = meta.query_advice(advices[5], Rotation::cur());
+            let mid_lt = meta.query_advice(advices[6], Rotation::cur());
+            let mid_eq = meta.query_advice(advices[7], Rotation::cur());
+            let lo_lt = meta.query_advice(advices[8], Rotation::cur());
+
+            // Row 1: High words
+            let word_5 = meta.query_advice(advices[0], Rotation::next());
+            let word_6 = meta.query_advice(advices[1], Rotation::next());
+            let word_7 = meta.query_advice(advices[2], Rotation::next());
+            let word_8 = meta.query_advice(advices[3], Rotation::next());
+            // Result flag: 1 if decomposition < p, 0 otherwise
+            let result_lt = meta.query_advice(advices[4], Rotation::next());
+
+            // Row 2: Difference witnesses for range checking
+            // These are used to verify the lt/eq flags are correct
+            let hi_diff = meta.query_advice(advices[0], Rotation(2));
+            let w4_diff = meta.query_advice(advices[1], Rotation(2));
+            let w3_diff = meta.query_advice(advices[2], Rotation(2));
+            let w2_diff = meta.query_advice(advices[3], Rotation(2));
+            let w1_diff = meta.query_advice(advices[4], Rotation(2));
+
+            // Pallas modulus words as Expression constants (little-endian)
+            let p_1 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[0] as u64));
+            let p_2 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[1] as u64));
+            let p_3 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[2] as u64));
+            let p_4 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[3] as u64));
+            // p_5 = p_6 = p_7 = 0
+            let p_8 = Expression::Constant(F::from(PALLAS_MODULUS_WORDS[7] as u64)); // 0x40000000
+
+            let two_32 = Expression::Constant(F::from(1u64 << 32));
+            let two_64 = Expression::Constant(F::from_u128(1u128 << 64));
+            let two_96 = Expression::Constant(F::from_u128(1u128 << 96));
+            let one = Expression::Constant(F::ONE);
+
+            // Check 1: hi_120_eq = 1 iff (word_8 == p_8 AND word_7 == 0 AND word_6 == 0 AND word_5 == 0)
+            // Compute: hi_120 = word_5 + word_6*2^32 + word_7*2^64 + word_8*2^96
+            // p_hi_120 = 0 + 0 + 0 + p_8*2^96 = p_8 * 2^96
+            let hi_120 = word_5.clone()
+                + word_6.clone() * two_32.clone()
+                + word_7.clone() * two_64.clone()
+                + word_8.clone() * two_96.clone();
+            let p_hi_120 = p_8.clone() * two_96;
+
+            // hi_120_eq: boolean check
+            let hi_120_eq_bool = bool_check(hi_120_eq.clone());
+
+            // hi_120_lt: boolean check
+            let hi_120_lt_bool = bool_check(hi_120_lt.clone());
+
+            // hi_diff should equal p_hi_120 - hi_120 - 1 when hi_120 < p_hi_120
+            // Constraint: hi_diff = hi_120_lt * (p_hi_120 - hi_120 - 1)
+            let hi_diff_check = hi_diff.clone()
+                - hi_120_lt.clone() * (p_hi_120.clone() - hi_120.clone() - one.clone());
+
+            // Constraint: hi_120_eq = 1 implies hi_120 = p_hi_120
+            let hi_eq_implies_equal =
+                hi_120_eq.clone() * (hi_120.clone() - p_hi_120.clone());
+
+            // Constraint: hi_120_lt + hi_120_eq must be 1 (exactly one is true)
+            // because hi_120 <= p_hi_120 is required (since word_8 <= p_8)
+            let hi_flag_sum = hi_120_lt.clone() + hi_120_eq.clone() - one.clone();
+
+            // Check 2: When hi_120_eq = 1, check words 3-4
+            // mid = word_3 + word_4 * 2^32
+            // p_mid = p_3 + p_4 * 2^32
+            let mid = word_3.clone() + word_4.clone() * two_32.clone();
+            let p_mid = p_3.clone() + p_4.clone() * two_32.clone();
+
+            let mid_lt_bool = bool_check(mid_lt.clone());
+            let mid_eq_bool = bool_check(mid_eq.clone());
+
+            // For mid comparison: mid < p_mid
+            // mid_lt = 1 implies mid < p_mid
+            // mid_eq = 1 implies mid == p_mid
+            // Conditional: only relevant when hi_120_eq = 1
+            let mid_diff_check = hi_120_eq.clone()
+                * (w4_diff.clone() + w3_diff.clone() * two_32.clone()
+                    - mid_lt.clone() * (p_mid.clone() - mid.clone() - one.clone()));
+
+            let mid_eq_implies_equal =
+                hi_120_eq.clone() * mid_eq.clone() * (mid.clone() - p_mid.clone());
+
+            // (hi_120_eq = 1) implies (mid_lt + mid_eq = 1)
+            let mid_flag_sum = hi_120_eq.clone() * (mid_lt.clone() + mid_eq.clone() - one.clone());
+
+            // Check 3: When hi_120_eq = 1 AND mid_eq = 1, check words 1-2
+            // lo = word_1 + word_2 * 2^32
+            // p_lo = p_1 + p_2 * 2^32
+            let lo = word_1.clone() + word_2.clone() * two_32.clone();
+            let p_lo = p_1.clone() + p_2.clone() * two_32.clone();
+
+            let lo_lt_bool = bool_check(lo_lt.clone());
+
+            // lo_lt = 1 implies lo < p_lo
+            let lo_diff_check = hi_120_eq.clone()
+                * mid_eq.clone()
+                * (w2_diff.clone() + w1_diff.clone() * two_32
+                    - lo_lt.clone() * (p_lo.clone() - lo.clone() - one.clone()));
+
+            // When hi_120_eq AND mid_eq, lo must be < p_lo (strictly)
+            let lo_flag_check = hi_120_eq.clone() * mid_eq.clone() * (lo_lt.clone() - one.clone());
+
+            // Final result: result_lt = 1 iff decomposition < p
+            // result_lt = hi_120_lt OR (hi_120_eq AND (mid_lt OR (mid_eq AND lo_lt)))
+            let result_lt_bool = bool_check(result_lt.clone());
+            let result_check = result_lt.clone()
+                - hi_120_lt.clone()
+                - hi_120_eq.clone() * (mid_lt.clone() + mid_eq.clone() * lo_lt.clone())
+                + hi_120_lt.clone()
+                    * hi_120_eq.clone()
+                    * (mid_lt.clone() + mid_eq.clone() * lo_lt.clone());
+
+            // Final constraint: result_lt must be 1
+            let result_must_be_one = result_lt.clone() - one;
+
+            Constraints::with_selector(
+                s_canonicality,
+                [
+                    ("hi_120_eq bool", hi_120_eq_bool),
+                    ("hi_120_lt bool", hi_120_lt_bool),
+                    ("hi_diff check", hi_diff_check),
+                    ("hi_eq implies equal", hi_eq_implies_equal),
+                    ("hi_flag_sum", hi_flag_sum),
+                    ("mid_lt bool", mid_lt_bool),
+                    ("mid_eq bool", mid_eq_bool),
+                    ("mid_diff check", mid_diff_check),
+                    ("mid_eq implies equal", mid_eq_implies_equal),
+                    ("mid_flag_sum", mid_flag_sum),
+                    ("lo_lt bool", lo_lt_bool),
+                    ("lo_diff check", lo_diff_check),
+                    ("lo_flag_check", lo_flag_check),
+                    ("result_lt bool", result_lt_bool),
+                    ("result check", result_check),
+                    ("result must be one", result_must_be_one),
+                ],
+            )
+        });
+
         Blake2sConfig {
             advices,
             s_field_decompose,
@@ -370,6 +561,7 @@ impl<F: PrimeField> Blake2sConfig<F> {
             s_byte_xor,
             s_word_add,
             s_result_encode,
+            s_canonicality,
             _marker: PhantomData,
         }
     }
@@ -832,6 +1024,11 @@ impl<F: PrimeField> Blake2sChip<F> {
             },
         )?;
 
+        // SOUNDNESS FIX: Canonicality check
+        // Ensure the 8-word decomposition represents a value strictly less than p.
+        // Without this, a prover could use the non-canonical representation (value + p).
+        self.check_canonicality(layouter, &words)?;
+
         let res = bits
             .chunks(32)
             .zip(words)
@@ -842,6 +1039,181 @@ impl<F: PrimeField> Blake2sChip<F> {
             .collect::<Vec<_>>();
 
         Ok(res)
+    }
+
+    /// Check that the 8-word decomposition is canonical (strictly less than p).
+    ///
+    /// This is a critical soundness check. Without it, a malicious prover could
+    /// decompose a field element f as either f or f+p (both satisfy the mod-p
+    /// constraint), leading to different BLAKE2s outputs for the "same" field value.
+    fn check_canonicality(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        words: &[AssignedCell<F, F>],
+    ) -> Result<(), Error> {
+        assert_eq!(words.len(), 8);
+
+        // Pallas modulus words
+        let p = PALLAS_MODULUS_WORDS;
+
+        layouter.assign_region(
+            || "canonicality check",
+            |mut region| {
+                self.config.s_canonicality.enable(&mut region, 0)?;
+
+                // Row 0: words 1-4 and comparison flags
+                for i in 0..4 {
+                    words[i].copy_advice(
+                        || format!("word_{}", i + 1),
+                        &mut region,
+                        self.config.advices[i],
+                        0,
+                    )?;
+                }
+
+                // Row 1: words 5-8
+                for i in 4..8 {
+                    words[i].copy_advice(
+                        || format!("word_{}", i + 1),
+                        &mut region,
+                        self.config.advices[i - 4],
+                        1,
+                    )?;
+                }
+
+                // Compute word values for comparison
+                let word_values: Vec<Value<u64>> = words
+                    .iter()
+                    .map(|w| {
+                        w.value().map(|v| {
+                            let repr = v.to_repr();
+                            let bytes = repr.as_ref();
+                            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
+                        })
+                    })
+                    .collect();
+
+                // Compute hi_120 = word_5 + word_6*2^32 + word_7*2^64 + word_8*2^96
+                // and p_hi_120 = p_8 * 2^96 (since p_5=p_6=p_7=0)
+                let hi_120 = word_values[4]
+                    .zip(word_values[5])
+                    .zip(word_values[6])
+                    .zip(word_values[7])
+                    .map(|(((w5, w6), w7), w8)| {
+                        // Use u128 for intermediate calculation
+                        (w5 as u128)
+                            + ((w6 as u128) << 32)
+                            + ((w7 as u128) << 64)
+                            + ((w8 as u128) << 96)
+                    });
+
+                let p_hi_120 = (p[7] as u128) << 96;
+
+                // Compute comparison flags for hi_120
+                let hi_120_lt_val = hi_120.map(|h| if h < p_hi_120 { F::ONE } else { F::ZERO });
+                let hi_120_eq_val = hi_120.map(|h| if h == p_hi_120 { F::ONE } else { F::ZERO });
+
+                // Witness hi_120_lt and hi_120_eq on row 0
+                region.assign_advice(|| "hi_120_lt", self.config.advices[4], 0, || hi_120_lt_val)?;
+                region.assign_advice(|| "hi_120_eq", self.config.advices[5], 0, || hi_120_eq_val)?;
+
+                // Compute mid = word_3 + word_4 * 2^32
+                // p_mid = p_3 + p_4 * 2^32
+                let mid = word_values[2]
+                    .zip(word_values[3])
+                    .map(|(w3, w4)| (w3 as u64) + ((w4 as u64) << 32));
+                let p_mid = (p[2] as u64) + ((p[3] as u64) << 32);
+
+                let mid_lt_val = mid.map(|m| if m < p_mid { F::ONE } else { F::ZERO });
+                let mid_eq_val = mid.map(|m| if m == p_mid { F::ONE } else { F::ZERO });
+
+                region.assign_advice(|| "mid_lt", self.config.advices[6], 0, || mid_lt_val)?;
+                region.assign_advice(|| "mid_eq", self.config.advices[7], 0, || mid_eq_val)?;
+
+                // Compute lo = word_1 + word_2 * 2^32
+                // p_lo = p_1 + p_2 * 2^32
+                let lo = word_values[0]
+                    .zip(word_values[1])
+                    .map(|(w1, w2)| (w1 as u64) + ((w2 as u64) << 32));
+                let p_lo = (p[0] as u64) + ((p[1] as u64) << 32);
+
+                let lo_lt_val = lo.map(|l| if l < p_lo { F::ONE } else { F::ZERO });
+
+                region.assign_advice(|| "lo_lt", self.config.advices[8], 0, || lo_lt_val)?;
+
+                // Compute result_lt = hi_120_lt OR (hi_120_eq AND (mid_lt OR (mid_eq AND lo_lt)))
+                let result_lt_val = hi_120_lt_val
+                    .zip(hi_120_eq_val)
+                    .zip(mid_lt_val)
+                    .zip(mid_eq_val)
+                    .zip(lo_lt_val)
+                    .map(|((((hi_lt, hi_eq), m_lt), m_eq), l_lt)| {
+                        let hi_lt_bool = hi_lt == F::ONE;
+                        let hi_eq_bool = hi_eq == F::ONE;
+                        let m_lt_bool = m_lt == F::ONE;
+                        let m_eq_bool = m_eq == F::ONE;
+                        let l_lt_bool = l_lt == F::ONE;
+
+                        let result = hi_lt_bool || (hi_eq_bool && (m_lt_bool || (m_eq_bool && l_lt_bool)));
+                        if result { F::ONE } else { F::ZERO }
+                    });
+
+                region.assign_advice(|| "result_lt", self.config.advices[4], 1, || result_lt_val)?;
+
+                // Row 2: Difference witnesses for range checking
+                // hi_diff = (p_hi_120 - hi_120 - 1) when hi_120 < p_hi_120, else 0
+                let hi_diff_val = hi_120.map(|h| {
+                    if h < p_hi_120 {
+                        F::from_u128(p_hi_120 - h - 1)
+                    } else {
+                        F::ZERO
+                    }
+                });
+                region.assign_advice(|| "hi_diff", self.config.advices[0], 2, || hi_diff_val)?;
+
+                // w4_diff for mid comparison
+                let w4_diff_val = word_values[3].map(|w4| {
+                    if w4 < (p[3] as u64) {
+                        F::from((p[3] as u64) - w4 - 1)
+                    } else {
+                        F::ZERO
+                    }
+                });
+                region.assign_advice(|| "w4_diff", self.config.advices[1], 2, || w4_diff_val)?;
+
+                // w3_diff
+                let w3_diff_val = word_values[2].map(|w3| {
+                    if w3 < (p[2] as u64) {
+                        F::from((p[2] as u64) - w3 - 1)
+                    } else {
+                        F::ZERO
+                    }
+                });
+                region.assign_advice(|| "w3_diff", self.config.advices[2], 2, || w3_diff_val)?;
+
+                // w2_diff for lo comparison
+                let w2_diff_val = word_values[1].map(|w2| {
+                    if w2 < (p[1] as u64) {
+                        F::from((p[1] as u64) - w2 - 1)
+                    } else {
+                        F::ZERO
+                    }
+                });
+                region.assign_advice(|| "w2_diff", self.config.advices[3], 2, || w2_diff_val)?;
+
+                // w1_diff
+                let w1_diff_val = word_values[0].map(|w1| {
+                    if w1 < (p[0] as u64) {
+                        F::from((p[0] as u64) - w1 - 1)
+                    } else {
+                        F::ZERO
+                    }
+                });
+                region.assign_advice(|| "w1_diff", self.config.advices[4], 2, || w1_diff_val)?;
+
+                Ok(())
+            },
+        )
     }
 
     /// Decompose a word to four bytes.

@@ -740,3 +740,240 @@ fn test_compact_hash_nullifier_proof() {
     println!("SUCCESS: Proved knowledge of nullifier for compact action hash");
     println!("Expected hash: {}", hex::encode(hash_bytes));
 }
+
+/// Test: Compact Action Hash with Bytes Commitment for Efficient Verification
+///
+/// This is the production-ready architecture for voting:
+/// - Nullifier remains PRIVATE (the secret we're proving knowledge of)
+/// - Bytes commitment binds the prover to specific epk/enc values
+/// - Verifier computes bytes_commitment themselves from known transaction data
+/// - Only 8 public inputs instead of 88
+///
+/// Public inputs: [compact_hash (4 words), bytes_commitment (4 words)]
+#[test]
+fn test_compact_hash_with_bytes_commitment() {
+    use compact_test_data::*;
+
+    /// Circuit proving knowledge of nullifier with bytes commitment binding
+    struct CompactHashWithCommitmentCircuit {
+        // PRIVATE witnesses
+        nullifier: Value<pallas::Base>,
+        cmx: Value<pallas::Base>,
+        epk_bytes: Value<[u8; 32]>,
+        enc_prefix: Value<[u8; 52]>,
+    }
+
+    #[derive(Clone)]
+    struct CommitmentConfig {
+        blake2b_config: Blake2bConfig<pallas::Base>,
+        instance: Column<Instance>,
+    }
+
+    impl Circuit<pallas::Base> for CompactHashWithCommitmentCircuit {
+        type Config = CommitmentConfig;
+        type FloorPlanner = floor_planner::V1;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                nullifier: Value::unknown(),
+                cmx: Value::unknown(),
+                epk_bytes: Value::unknown(),
+                enc_prefix: Value::unknown(),
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
+            let advices = [
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+            ];
+
+            for advice in advices.iter() {
+                meta.enable_equality(*advice);
+            }
+
+            let instance = meta.instance_column();
+            meta.enable_equality(instance);
+
+            let constants = meta.fixed_column();
+            meta.enable_constant(constants);
+
+            CommitmentConfig {
+                blake2b_config: Blake2bConfig::configure(meta, advices),
+                instance,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<pallas::Base>,
+        ) -> Result<(), Error> {
+            let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
+
+            // Assign field inputs (both private in this circuit)
+            let nullifier = assign_free_advice(
+                layouter.namespace(|| "nullifier"),
+                config.blake2b_config.advices[0],
+                self.nullifier,
+            )?;
+
+            let cmx = assign_free_advice(
+                layouter.namespace(|| "cmx"),
+                config.blake2b_config.advices[0],
+                self.cmx,
+            )?;
+
+            // Assign byte inputs (epk and enc_prefix) - PRIVATE witnesses
+            let mut byte_cells = Vec::with_capacity(32 + 52);
+
+            for i in 0..32 {
+                let byte_val = self.epk_bytes.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                let byte_cell = assign_free_advice(
+                    layouter.namespace(|| format!("epk_byte_{}", i)),
+                    config.blake2b_config.advices[0],
+                    byte_val,
+                )?;
+                byte_cells.push(byte_cell);
+            }
+
+            for i in 0..52 {
+                let byte_val = self.enc_prefix.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                let byte_cell = assign_free_advice(
+                    layouter.namespace(|| format!("enc_byte_{}", i)),
+                    config.blake2b_config.advices[0],
+                    byte_val,
+                )?;
+                byte_cells.push(byte_cell);
+            }
+
+            // ============================================================
+            // HASH 1: Bytes Commitment (binds prover to specific epk/enc)
+            // ============================================================
+            // bytes_commitment = BLAKE2b("ZTxIdBytesCommit", epk || enc[0..52])
+            // This uses ONLY byte inputs (no field inputs), so no canonicality check
+            // Domain separation via different personalization prevents cross-protocol attacks
+            let bytes_commitment = blake2b_chip.process_hybrid(
+                &mut layouter,
+                &[],           // No field inputs
+                &byte_cells,   // Only bytes
+                b"ZTxIdBytesCommit",  // Domain-separated personalization
+            )?;
+
+            // ============================================================
+            // HASH 2: Compact Action Hash (proves nullifier knowledge)
+            // ============================================================
+            // compact_hash = BLAKE2b("ZTxIdOrcActCHash", nullifier || cmx || epk || enc[0..52])
+            // Uses the SAME byte_cells, ensuring both hashes use identical bytes
+            let compact_hash = blake2b_chip.process_hybrid(
+                &mut layouter,
+                &[nullifier, cmx],  // Field inputs (canonicality checked)
+                &byte_cells,        // Same bytes as commitment
+                b"ZTxIdOrcActCHash",
+            )?;
+
+            // ============================================================
+            // PUBLIC OUTPUTS
+            // ============================================================
+            // Instance layout: [compact_hash (4 words), bytes_commitment (4 words)]
+
+            // Expose compact_hash as public inputs [0..4]
+            for (i, word) in compact_hash.iter().enumerate() {
+                layouter.constrain_instance(
+                    word.get_word().cell(),
+                    config.instance,
+                    i,
+                )?;
+            }
+
+            // Expose bytes_commitment as public inputs [4..8]
+            for (i, word) in bytes_commitment.iter().enumerate() {
+                layouter.constrain_instance(
+                    word.get_word().cell(),
+                    config.instance,
+                    4 + i,
+                )?;
+            }
+
+            Ok(())
+        }
+    }
+
+    // ================================================================
+    // VERIFIER SIDE: Compute expected values from known transaction data
+    // ================================================================
+
+    // Verifier computes bytes_commitment from known epk/enc
+    let expected_bytes_commitment = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZTxIdBytesCommit")
+        .to_state()
+        .update(&EPHEMERAL_KEY)
+        .update(&C_ENC_PREFIX)
+        .finalize();
+
+    // Verifier computes expected compact_hash (for this test; in production
+    // this would come from the transaction or be verified against chain data)
+    let expected_compact_hash = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZTxIdOrcActCHash")
+        .to_state()
+        .update(&NF_OLD)
+        .update(&CMX)
+        .update(&EPHEMERAL_KEY)
+        .update(&C_ENC_PREFIX)
+        .finalize();
+
+    // Convert to field elements for public inputs
+    let hash_to_words = |hash: &blake2b_simd::Hash| -> Vec<pallas::Base> {
+        let bytes = hash.as_bytes();
+        (0..4)
+            .map(|i| {
+                let start = i * 8;
+                let word = u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
+                pallas::Base::from(word)
+            })
+            .collect()
+    };
+
+    let mut expected_public_inputs = hash_to_words(&expected_compact_hash);
+    expected_public_inputs.extend(hash_to_words(&expected_bytes_commitment));
+
+    // ================================================================
+    // PROVER SIDE: Create and run the circuit
+    // ================================================================
+
+    let nullifier = pallas::Base::from_repr(NF_OLD.into())
+        .expect("nullifier should be valid field element");
+    let cmx = pallas::Base::from_repr(CMX.into())
+        .expect("cmx should be valid field element");
+
+    let circuit = CompactHashWithCommitmentCircuit {
+        nullifier: Value::known(nullifier),
+        cmx: Value::known(cmx),
+        epk_bytes: Value::known(EPHEMERAL_KEY),
+        enc_prefix: Value::known(C_ENC_PREFIX),
+    };
+
+    // Note: k=17 may need to increase due to two BLAKE2b computations
+    let k = 17;
+    let prover = MockProver::run(k, &circuit, vec![expected_public_inputs]).unwrap();
+    assert_eq!(
+        prover.verify(),
+        Ok(()),
+        "Compact hash with bytes commitment proof failed"
+    );
+
+    println!("SUCCESS: Proved nullifier knowledge with bytes commitment binding");
+    println!("Compact hash:      {}", hex::encode(expected_compact_hash.as_bytes()));
+    println!("Bytes commitment:  {}", hex::encode(expected_bytes_commitment.as_bytes()));
+    println!("Public inputs: 8 field elements (vs 88 with raw bytes)");
+}

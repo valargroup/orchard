@@ -736,11 +736,14 @@ impl<F: PrimeField> Blake2bChip<F> {
         }
 
         // Compress final block with total byte count
+        // Note: Unlike process(), we use actual byte count here for compatibility
+        // with standard BLAKE2b (e.g., blake2b_simd). The .max(128) in process()
+        // was designed for field-element inputs that are always multiples of 32 bytes.
         self.compress(
             layouter,
             &mut h,
             &blocks[block_len - 1],
-            total_bytes.max(128) as u128,
+            total_bytes as u128,
             true,
         )?;
 

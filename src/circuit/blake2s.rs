@@ -67,21 +67,7 @@ const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
-// Pallas modulus words (little-endian, word_1 is least significant):
-// p = 0x40000000_00000000_00000000_00000000_224698fc_094cf91b_992d30ed_00000001
-// This is used for canonicality checks to ensure field decomposition is unique.
-const PALLAS_MODULUS_WORDS: [u32; 8] = [
-    0x00000001, // word_1 (bits 0-31)
-    0x992d30ed, // word_2 (bits 32-63)
-    0x094cf91b, // word_3 (bits 64-95)
-    0x224698fc, // word_4 (bits 96-127)
-    0x00000000, // word_5 (bits 128-159)
-    0x00000000, // word_6 (bits 160-191)
-    0x00000000, // word_7 (bits 192-223)
-    0x40000000, // word_8 (bits 224-255)
-];
-
-// Lower 128 bits of pallas modulus as a u128 for comparison
+// Lower 128 bits of pallas base field modulus as a u128 for canonicality comparison.
 // p_lower = 0x224698fc_094cf91b_992d30ed_00000001
 const PALLAS_MODULUS_LOWER_128: u128 = 0x224698fc_094cf91b_992d30ed_00000001;
 

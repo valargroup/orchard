@@ -67,6 +67,10 @@ const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
+// Lower 128 bits of pallas base field modulus as a u128 for canonicality comparison.
+// p_lower = 0x224698fc_094cf91b_992d30ed_00000001
+const PALLAS_MODULUS_LOWER_128: u128 = 0x224698fc_094cf91b_992d30ed_00000001;
+
 // The SIGMA constant in Blake2s is a 10x16 array that defines the message permutations in the
 // algorithm. Each of the 10 rows corresponds to a round of the hashing process, and each of the
 // 16 elements in the row determines the message block order.
@@ -117,6 +121,10 @@ pub struct Blake2sConfig<F: PrimeField> {
     pub s_word_add: Selector,
     /// Selector for result encoding gate.
     pub s_result_encode: Selector,
+    /// Selector for canonicality check gate (ensures field decomposition < p).
+    pub s_canonicality: Selector,
+    /// Selector for high bit zero check (bit_254 * bit = 0 for bits 128-253).
+    pub s_high_bit_zero: Selector,
     _marker: PhantomData<F>,
 }
 
@@ -223,6 +231,8 @@ impl<F: PrimeField> Blake2sConfig<F> {
         let s_byte_xor = meta.selector();
         let s_word_add = meta.selector();
         let s_result_encode = meta.selector();
+        let s_canonicality = meta.selector();
+        let s_high_bit_zero = meta.selector();
 
         meta.create_gate("decompose field to words", |meta| {
             let field_element = meta.query_advice(advices[0], Rotation::next());
@@ -280,18 +290,34 @@ impl<F: PrimeField> Blake2sConfig<F> {
             let bit_8 = meta.query_advice(advices[7], Rotation::cur());
             let s_byte_decompose = meta.query_selector(s_byte_decompose);
 
-            vec![
-                s_byte_decompose
-                    * (bit_1
-                        + bit_2 * F::from(1 << 1)
-                        + bit_3 * F::from(1 << 2)
-                        + bit_4 * F::from(1 << 3)
-                        + bit_5 * F::from(1 << 4)
-                        + bit_6 * F::from(1 << 5)
-                        + bit_7 * F::from(1 << 6)
-                        + bit_8 * F::from(1 << 7)
-                        - byte),
-            ]
+            // Decomposition constraint: bits sum to byte
+            let decomposition = bit_1.clone()
+                + bit_2.clone() * F::from(1 << 1)
+                + bit_3.clone() * F::from(1 << 2)
+                + bit_4.clone() * F::from(1 << 3)
+                + bit_5.clone() * F::from(1 << 4)
+                + bit_6.clone() * F::from(1 << 5)
+                + bit_7.clone() * F::from(1 << 6)
+                + bit_8.clone() * F::from(1 << 7)
+                - byte;
+
+            // SOUNDNESS FIX: Each bit must be boolean (0 or 1)
+            // Without these constraints, a malicious prover could use invalid
+            // values that still satisfy the decomposition equation.
+            Constraints::with_selector(
+                s_byte_decompose,
+                [
+                    ("decomposition", decomposition),
+                    ("bit_1 bool", bool_check(bit_1)),
+                    ("bit_2 bool", bool_check(bit_2)),
+                    ("bit_3 bool", bool_check(bit_3)),
+                    ("bit_4 bool", bool_check(bit_4)),
+                    ("bit_5 bool", bool_check(bit_5)),
+                    ("bit_6 bool", bool_check(bit_6)),
+                    ("bit_7 bool", bool_check(bit_7)),
+                    ("bit_8 bool", bool_check(bit_8)),
+                ],
+            )
         });
 
         meta.create_gate("byte xor", |meta| {
@@ -346,6 +372,117 @@ impl<F: PrimeField> Blake2sConfig<F> {
             ]
         });
 
+        // CANONICALITY CHECK GATE (BIT-LEVEL)
+        //
+        // This gate ensures that the 256-bit decomposition of a field element is
+        // strictly less than the pallas modulus p, using direct bit constraints.
+        //
+        // The pallas modulus is:
+        // p = 0x40000000_00000000_00000000_00000000_224698fc_094cf91b_992d30ed_00000001
+        //
+        // In binary: bit 255 = 0, bit 254 = 1, bits 253-128 = 0, bits 127-0 = lower part
+        //
+        // For a canonical value x < p:
+        // - Case 1: bit[255] = 0 AND bit[254] = 0 → x < 2^254 < p ✓
+        // - Case 2: bit[255] = 0 AND bit[254] = 1 → x ∈ [2^254, 2^255)
+        //   - If any of bits[253..128] = 1 → x >= 2^254 + 2^128 > p ✗
+        //   - If bits[253..128] = 0 → need bits[127..0] < p's lower 128 bits
+        //
+        // This gate checks:
+        // 1. bit[255] = 0 (always required)
+        // 2. If bit[254] = 1: lower 128 bits must be < p_lower via diff decomposition
+        //
+        // The check for bits[253..128] = 0 when bit[254] = 1 is done separately
+        // using s_high_bit_zero gate applied to each bit individually.
+        //
+        // Layout (2 rows):
+        // Row 0: bit_255, bit_254, lower_128_diff, diff_w1, diff_w2, diff_w3, diff_w4, w1, w2, w3
+        // Row 1: w4, lower_128
+        meta.create_gate("canonicality check", |meta| {
+            use halo2_proofs::plonk::Expression;
+
+            let s_canonicality = meta.query_selector(s_canonicality);
+
+            // Query the critical bits (copied from actual bit cells)
+            let bit_255 = meta.query_advice(advices[0], Rotation::cur());
+            let bit_254 = meta.query_advice(advices[1], Rotation::cur());
+
+            // The diff value and its decomposition
+            let lower_128_diff = meta.query_advice(advices[2], Rotation::cur());
+            let diff_word_1 = meta.query_advice(advices[3], Rotation::cur());
+            let diff_word_2 = meta.query_advice(advices[4], Rotation::cur());
+            let diff_word_3 = meta.query_advice(advices[5], Rotation::cur());
+            let diff_word_4 = meta.query_advice(advices[6], Rotation::cur());
+
+            // The 4 words that make up lower_128 (copied from actual word cells)
+            let word_1 = meta.query_advice(advices[7], Rotation::cur());
+            let word_2 = meta.query_advice(advices[8], Rotation::cur());
+            let word_3 = meta.query_advice(advices[9], Rotation::cur());
+            let word_4 = meta.query_advice(advices[0], Rotation::next());
+
+            // The computed lower_128 value
+            let lower_128 = meta.query_advice(advices[1], Rotation::next());
+
+            let one = Expression::Constant(F::ONE);
+            let p_lower = Expression::Constant(F::from_u128(PALLAS_MODULUS_LOWER_128));
+            let two_32 = Expression::Constant(F::from(1u64 << 32));
+
+            // Constraint 1: bit_255 must be 0
+            let bit_255_zero = bit_255;
+
+            // Constraint 2: lower_128 must equal word_1 + word_2*2^32 + word_3*2^64 + word_4*2^96
+            // This ensures lower_128 is properly constrained to the actual words
+            let lower_128_decomposition = lower_128.clone()
+                - word_1
+                - word_2 * two_32.clone()
+                - word_3 * Expression::Constant(F::from_u128(1u128 << 64))
+                - word_4 * Expression::Constant(F::from_u128(1u128 << 96));
+
+            // Constraint 3: When bit_254 = 1, we need lower_128 < p_lower
+            // Verify using: lower_128_diff = p_lower - 1 - lower_128
+            // When bit_254 = 0, this constraint is disabled (multiplied by 0)
+            let diff_check = bit_254.clone()
+                * (lower_128_diff.clone() - (p_lower - one - lower_128));
+
+            // Constraint 4: Verify lower_128_diff decomposes correctly into 4 words
+            // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
+            // The diff_words are range-checked via s_word_decompose elsewhere
+            let diff_decomposition = bit_254
+                * (lower_128_diff
+                    - diff_word_1
+                    - diff_word_2 * two_32
+                    - diff_word_3 * Expression::Constant(F::from_u128(1u128 << 64))
+                    - diff_word_4 * Expression::Constant(F::from_u128(1u128 << 96)));
+
+            Constraints::with_selector(
+                s_canonicality,
+                [
+                    ("bit_255 must be zero", bit_255_zero),
+                    ("lower_128 decomposition", lower_128_decomposition),
+                    ("diff equals p_lower - 1 - lower_128", diff_check),
+                    ("diff decomposes to 4 words", diff_decomposition),
+                ],
+            )
+        });
+
+        // HIGH BIT ZERO CHECK GATE
+        //
+        // This gate constrains: bit_254 * bit = 0
+        // Applied to each bit in [128..254] to ensure they're all 0 when bit_254 = 1.
+        //
+        // Layout (1 row):
+        // Row 0: bit_254, bit_to_check
+        meta.create_gate("high bit zero check", |meta| {
+            let s_high_bit_zero = meta.query_selector(s_high_bit_zero);
+
+            let bit_254 = meta.query_advice(advices[0], Rotation::cur());
+            let bit_to_check = meta.query_advice(advices[1], Rotation::cur());
+
+            // If bit_254 = 1, then bit_to_check must be 0
+            // If bit_254 = 0, this constraint is satisfied for any bit value
+            Constraints::with_selector(s_high_bit_zero, [("bit_254 * bit = 0", bit_254 * bit_to_check)])
+        });
+
         Blake2sConfig {
             advices,
             s_field_decompose,
@@ -354,6 +491,8 @@ impl<F: PrimeField> Blake2sConfig<F> {
             s_byte_xor,
             s_word_add,
             s_result_encode,
+            s_canonicality,
+            s_high_bit_zero,
             _marker: PhantomData,
         }
     }
@@ -816,6 +955,12 @@ impl<F: PrimeField> Blake2sChip<F> {
             },
         )?;
 
+        // SOUNDNESS FIX: Canonicality check
+        // Ensure the 256-bit decomposition represents a value strictly less than p.
+        // Without this, a prover could use the non-canonical representation (value + p).
+        // We pass both the bits (for direct bit constraints) and words (for lower_128 computation).
+        self.check_canonicality(layouter, &bits, &words)?;
+
         let res = bits
             .chunks(32)
             .zip(words)
@@ -826,6 +971,166 @@ impl<F: PrimeField> Blake2sChip<F> {
             .collect::<Vec<_>>();
 
         Ok(res)
+    }
+
+    /// Check that the 256-bit decomposition is canonical (strictly less than p).
+    ///
+    /// This is a critical soundness check. Without it, a malicious prover could
+    /// decompose a field element f as either f or f+p (both satisfy the mod-p
+    /// constraint), leading to different BLAKE2s outputs for the "same" field value.
+    ///
+    /// The check uses the 256 bits directly:
+    /// 1. bit[255] must be 0
+    /// 2. If bit[254] = 1, bits[253..128] must all be 0
+    /// 3. If bit[254] = 1, lower 128 bits must be < p's lower 128 bits
+    ///
+    /// All witness values are properly constrained via copy_advice to ensure
+    /// they match the actual bit and word cells from field decomposition.
+    ///
+    /// The diff value (p_lower - 1 - lower_128) is decomposed into 4 words,
+    /// and each word is range-checked via s_word_decompose to ensure diff >= 0.
+    fn check_canonicality(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        bits: &[AssignedCell<F, F>],
+        words: &[AssignedCell<F, F>],
+    ) -> Result<(), Error> {
+        assert_eq!(bits.len(), 256);
+        assert_eq!(words.len(), 8);
+
+        // Extract key bits
+        let bit_255 = &bits[255];
+        let bit_254 = &bits[254];
+
+        // Compute lower 128 bits as a field element
+        // lower_128 = word_1 + word_2 * 2^32 + word_3 * 2^64 + word_4 * 2^96
+        let lower_128: Value<u128> = words[0]
+            .value()
+            .zip(words[1].value())
+            .zip(words[2].value())
+            .zip(words[3].value())
+            .map(|(((w1, w2), w3), w4)| {
+                let to_u32 = |f: &F| -> u32 {
+                    let repr = f.to_repr();
+                    let bytes = repr.as_ref();
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                };
+                (to_u32(w1) as u128)
+                    + ((to_u32(w2) as u128) << 32)
+                    + ((to_u32(w3) as u128) << 64)
+                    + ((to_u32(w4) as u128) << 96)
+            });
+
+        // Compute diff = p_lower - 1 - lower_128
+        // If lower_128 < p_lower, diff is in [0, p_lower - 1]
+        // If lower_128 >= p_lower, diff would be "negative" (wrap around)
+        let p_lower = PALLAS_MODULUS_LOWER_128;
+        let diff: Value<u128> = lower_128.map(|l| {
+            if l < p_lower {
+                p_lower - 1 - l
+            } else {
+                // This case should never happen for canonical values
+                // Set to 0; the constraint will fail
+                0
+            }
+        });
+
+        // Decompose diff into 4 32-bit words for range checking
+        let diff_word_values: [Value<u32>; 4] = [
+            diff.map(|d| d as u32),
+            diff.map(|d| (d >> 32) as u32),
+            diff.map(|d| (d >> 64) as u32),
+            diff.map(|d| (d >> 96) as u32),
+        ];
+
+        // Assign the canonicality check region and get back the diff_word cells
+        // for range checking. All bits and words are copied via copy_advice.
+        let diff_word_cells = layouter.assign_region(
+            || "canonicality check",
+            |mut region| {
+                self.config.s_canonicality.enable(&mut region, 0)?;
+
+                // Row 0: bit_255, bit_254, lower_128_diff, diff_w1..diff_w4, w1, w2, w3
+                // Use copy_advice to constrain these to the actual bit/word cells
+                bit_255.copy_advice(|| "bit_255", &mut region, self.config.advices[0], 0)?;
+                bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[1], 0)?;
+
+                // Witness the diff value
+                let diff_field = diff.map(|d| F::from_u128(d));
+                region.assign_advice(|| "lower_128_diff", self.config.advices[2], 0, || diff_field)?;
+
+                // Assign diff words and collect the cells for later range checking
+                let mut diff_cells = Vec::with_capacity(4);
+                for (i, dw) in diff_word_values.iter().enumerate() {
+                    let cell = region.assign_advice(
+                        || format!("diff_word_{}", i + 1),
+                        self.config.advices[3 + i],
+                        0,
+                        || dw.map(|w| F::from(w as u64)),
+                    )?;
+                    diff_cells.push(cell);
+                }
+
+                // Copy words[0..4] using copy_advice to constrain lower_128
+                words[0].copy_advice(|| "word_1", &mut region, self.config.advices[7], 0)?;
+                words[1].copy_advice(|| "word_2", &mut region, self.config.advices[8], 0)?;
+                words[2].copy_advice(|| "word_3", &mut region, self.config.advices[9], 0)?;
+
+                // Row 1: word_4, lower_128
+                words[3].copy_advice(|| "word_4", &mut region, self.config.advices[0], 1)?;
+
+                // Assign lower_128 - this is constrained by the gate to equal
+                // word_1 + word_2*2^32 + word_3*2^64 + word_4*2^96
+                let lower_128_field = lower_128.map(|l| F::from_u128(l));
+                region.assign_advice(|| "lower_128", self.config.advices[1], 1, || lower_128_field)?;
+
+                Ok(diff_cells)
+            },
+        )?;
+
+        // Apply s_high_bit_zero gate to each bit in [128..254]
+        // This constrains: bit_254 * bit[i] = 0 for each bit
+        // Using copy_advice ensures we're checking the actual bits
+        for (i, bit) in bits[128..254].iter().enumerate() {
+            layouter.assign_region(
+                || format!("high bit zero check {}", i),
+                |mut region| {
+                    self.config.s_high_bit_zero.enable(&mut region, 0)?;
+                    bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[0], 0)?;
+                    bit.copy_advice(|| "bit_to_check", &mut region, self.config.advices[1], 0)?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        // Range-check each diff word by decomposing it to bytes
+        // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
+        // The diff_word_cells are the SAME cells from the canonicality region
+        for (i, (dw_val, dw_cell)) in diff_word_values.iter().zip(diff_word_cells.iter()).enumerate()
+        {
+            // Decompose each diff word into 4 bytes, then each byte into bits
+            // The bit boolean constraints will ensure each word is in [0, 2^32 - 1]
+            let mut diff_bytes = Vec::with_capacity(4);
+            for j in 0..4 {
+                let byte_val = dw_val.map(|w| ((w >> (j * 8)) & 0xFF) as u8);
+                let byte = Blake2sByte::from_u8(
+                    byte_val,
+                    layouter.namespace(|| format!("diff_word_{}_byte_{}", i, j)),
+                    &self.config,
+                )?;
+                diff_bytes.push(byte.get_byte());
+            }
+
+            // Use the SAME diff_word cell from the canonicality region
+            // This ensures the range-checked word is the same as the one in the constraint
+            self.word_decompose(
+                layouter.namespace(|| format!("diff_word_{}_decompose", i)),
+                &diff_bytes,
+                dw_cell,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Decompose a word to four bytes.

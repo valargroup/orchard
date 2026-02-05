@@ -280,18 +280,34 @@ impl<F: PrimeField> Blake2sConfig<F> {
             let bit_8 = meta.query_advice(advices[7], Rotation::cur());
             let s_byte_decompose = meta.query_selector(s_byte_decompose);
 
-            vec![
-                s_byte_decompose
-                    * (bit_1
-                        + bit_2 * F::from(1 << 1)
-                        + bit_3 * F::from(1 << 2)
-                        + bit_4 * F::from(1 << 3)
-                        + bit_5 * F::from(1 << 4)
-                        + bit_6 * F::from(1 << 5)
-                        + bit_7 * F::from(1 << 6)
-                        + bit_8 * F::from(1 << 7)
-                        - byte),
-            ]
+            // Decomposition constraint: bits sum to byte
+            let decomposition = bit_1.clone()
+                + bit_2.clone() * F::from(1 << 1)
+                + bit_3.clone() * F::from(1 << 2)
+                + bit_4.clone() * F::from(1 << 3)
+                + bit_5.clone() * F::from(1 << 4)
+                + bit_6.clone() * F::from(1 << 5)
+                + bit_7.clone() * F::from(1 << 6)
+                + bit_8.clone() * F::from(1 << 7)
+                - byte;
+
+            // SOUNDNESS FIX: Each bit must be boolean (0 or 1)
+            // Without these constraints, a malicious prover could use invalid
+            // values that still satisfy the decomposition equation.
+            Constraints::with_selector(
+                s_byte_decompose,
+                [
+                    ("decomposition", decomposition),
+                    ("bit_1 bool", bool_check(bit_1)),
+                    ("bit_2 bool", bool_check(bit_2)),
+                    ("bit_3 bool", bool_check(bit_3)),
+                    ("bit_4 bool", bool_check(bit_4)),
+                    ("bit_5 bool", bool_check(bit_5)),
+                    ("bit_6 bool", bool_check(bit_6)),
+                    ("bit_7 bool", bool_check(bit_7)),
+                    ("bit_8 bool", bool_check(bit_8)),
+                ],
+            )
         });
 
         meta.create_gate("byte xor", |meta| {

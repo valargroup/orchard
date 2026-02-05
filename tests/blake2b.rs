@@ -215,17 +215,20 @@ mod reference {
         }
     }
 
-    /// Compute BLAKE2b hash matching the circuit's input format
+    /// Compute BLAKE2b-256 hash matching the circuit's input format
     /// Input: field element bytes (32 bytes each), personalization (16 bytes)
     ///
     /// BLAKE2b uses 128-byte blocks. The circuit processes inputs in chunks of 4 field
     /// elements (4 * 32 = 128 bytes) per block. Each field element provides 4 x 64-bit
     /// words, so one block = 4 fields = 16 x 64-bit words = 128 bytes.
-    pub fn blake2b_hash(inputs: &[&[u8; 32]], personalization: &[u8; 16]) -> [u64; 8] {
+    ///
+    /// BLAKE2B-MOD: Returns 4 words (256 bits) for BLAKE2b-256, matching Orchard's
+    /// action hash requirements (ZIP-244).
+    pub fn blake2b_hash(inputs: &[&[u8; 32]], personalization: &[u8; 16]) -> [u64; 4] {
         // Initialize state with personalization
-        // BLAKE2B-MOD: 64-byte output length
+        // BLAKE2B-MOD: 32-byte output length (BLAKE2b-256)
         let mut h = [
-            IV[0] ^ 0x01010000 ^ 64,
+            IV[0] ^ 0x01010000 ^ 32,
             IV[1],
             IV[2],
             IV[3],
@@ -281,7 +284,8 @@ mod reference {
             compress(&mut h, &m, t, is_last);
         }
 
-        h
+        // BLAKE2B-MOD: Return first 4 words (256 bits) for BLAKE2b-256
+        [h[0], h[1], h[2], h[3]]
     }
 }
 
@@ -367,7 +371,7 @@ fn test_blake2b_against_reference() {
                 &self.personalization,
             )?;
 
-            // Expose all 8 words as public inputs
+            // BLAKE2B-MOD: Expose all 4 words (256 bits) as public inputs
             for (i, word) in result.iter().enumerate() {
                 layouter.constrain_instance(
                     word.get_word().cell(),
@@ -489,6 +493,7 @@ fn test_blake2b_zeros_against_reference() {
                 &[0u8; 16],
             )?;
 
+            // BLAKE2B-MOD: Expose all 4 words (256 bits) as public inputs
             for (i, word) in result.iter().enumerate() {
                 layouter.constrain_instance(
                     word.get_word().cell(),

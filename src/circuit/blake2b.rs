@@ -1,20 +1,20 @@
-//! BLAKE2s circuit implementation for Halo2.
+//! BLAKE2b circuit implementation for Halo2.
 //!
-//! This is a 1:1 port of Anoma's BLAKE2s circuit from:
+//! Based on Anoma's BLAKE2s circuit, modified for BLAKE2b:
 //! https://github.com/anoma/taiga/blob/main/taiga_halo2/src/circuit/blake2s.rs
 //!
-//! BLAKE2s parameters:
-//!               | BLAKE2s          |
+//! BLAKE2b parameters:
+//!               | BLAKE2b          |
 //! --------------+------------------+
-//!  Bits in word | w = 32           |
-//!  Rounds in F  | r = 10           |
-//!  Block bytes  | bb = 64          |
-//!  Hash bytes   | 1 <= nn <= 32    |
-//!  Key bytes    | 0 <= kk <= 32    |
-//!  Input bytes  | 0 <= ll < 2**64  |
+//!  Bits in word | w = 64           |
+//!  Rounds in F  | r = 12           |
+//!  Block bytes  | bb = 128         |
+//!  Hash bytes   | 1 <= nn <= 64    |
+//!  Key bytes    | 0 <= kk <= 64    |
+//!  Input bytes  | 0 <= ll < 2**128 |
 //! --------------+------------------+
 //!  G Rotation   | (R1, R2, R3, R4) |
-//!   constants = | (16, 12,  8,  7) |
+//!   constants = | (32, 24, 16, 63) |
 //! --------------+------------------+
 
 use alloc::vec;
@@ -59,12 +59,20 @@ pub fn assign_free_constant<F: PrimeField>(
 }
 
 // ----------------
-// BLAKE2 CONSTANTS
+// BLAKE2b CONSTANTS
 // ----------------
 
-// Initialisation Vector (IV)
-const IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+// BLAKE2B-MOD: 64-bit Initialisation Vector (IV)
+// These are the first 64 bits of the fractional parts of sqrt(2..9)
+const IV: [u64; 8] = [
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
 ];
 
 // Lower 128 bits of pallas base field modulus as a u128 for canonicality comparison.
@@ -87,26 +95,28 @@ const SIGMA: [[usize; 16]; 10] = [
     [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
 ];
 
-// G Rotation constants
-const R1: usize = 16;
-const R2: usize = 12;
-const R3: usize = 8;
-const R4: usize = 7;
+// BLAKE2B-MOD: G Rotation constants for 64-bit words
+// BLAKE2s used (16, 12, 8, 7), BLAKE2b uses (32, 24, 16, 63)
+const R1: usize = 32;
+const R2: usize = 24;
+const R3: usize = 16;
+const R4: usize = 63;
 
-const ROUNDS: usize = 10;
+// BLAKE2B-MOD: 12 rounds (was 10 in BLAKE2s)
+const ROUNDS: usize = 12;
 
 // ---------------
 
-/// BLAKE2s chip for halo2.
+/// BLAKE2b chip for halo2.
 #[derive(Clone, Debug)]
-pub struct Blake2sChip<F: PrimeField> {
-    config: Blake2sConfig<F>,
+pub struct Blake2bChip<F: PrimeField> {
+    config: Blake2bConfig<F>,
     _marker: PhantomData<F>,
 }
 
-/// Configuration for the BLAKE2s chip.
+/// Configuration for the BLAKE2b chip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Blake2sConfig<F: PrimeField> {
+pub struct Blake2bConfig<F: PrimeField> {
     /// Advice columns used by the chip.
     pub advices: [Column<Advice>; 10],
     /// Selector for field decomposition gate.
@@ -128,21 +138,21 @@ pub struct Blake2sConfig<F: PrimeField> {
     _marker: PhantomData<F>,
 }
 
-/// One blockword has 4 bytes (32 bits).
+/// BLAKE2B-MOD: One blockword has 8 bytes (64 bits) - was 4 bytes (32 bits) in BLAKE2s
 #[derive(Clone, Debug)]
-pub struct Blake2sWord<F: PrimeField> {
+pub struct Blake2bWord<F: PrimeField> {
     word: AssignedCell<F, F>,
-    bits: [AssignedCell<F, F>; 32],
+    bits: [AssignedCell<F, F>; 64],
 }
 
 /// One byte has 8 bits.
 #[derive(Clone, Debug)]
-struct Blake2sByte<F: PrimeField> {
+struct Blake2bByte<F: PrimeField> {
     byte: AssignedCell<F, F>,
     bits: [AssignedCell<F, F>; 8],
 }
 
-impl<F: PrimeField> Blake2sByte<F> {
+impl<F: PrimeField> Blake2bByte<F> {
     pub fn get_byte(&self) -> AssignedCell<F, F> {
         self.byte.clone()
     }
@@ -154,7 +164,7 @@ impl<F: PrimeField> Blake2sByte<F> {
     pub fn from_u8(
         value: Value<u8>,
         mut layouter: impl Layouter<F>,
-        config: &Blake2sConfig<F>,
+        config: &Blake2bConfig<F>,
     ) -> Result<Self, Error> {
         layouter.assign_region(
             || "decompose bytes to bits",
@@ -185,7 +195,7 @@ impl<F: PrimeField> Blake2sByte<F> {
     pub fn from_constant_u8(
         value: u8,
         layouter: &mut impl Layouter<F>,
-        config: &Blake2sConfig<F>,
+        config: &Blake2bConfig<F>,
     ) -> Result<Self, Error> {
         layouter.assign_region(
             || "decompose bytes to bits",
@@ -219,12 +229,12 @@ impl<F: PrimeField> Blake2sByte<F> {
     }
 }
 
-impl<F: PrimeField> Blake2sConfig<F> {
+impl<F: PrimeField> Blake2bConfig<F> {
     /// Configure the BLAKE2s chip.
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
         advices: [Column<Advice>; 10],
-    ) -> Blake2sConfig<F> {
+    ) -> Blake2bConfig<F> {
         let s_field_decompose = meta.selector();
         let s_word_decompose = meta.selector();
         let s_byte_decompose = meta.selector();
@@ -260,12 +270,17 @@ impl<F: PrimeField> Blake2sConfig<F> {
             ]
         });
 
+        // BLAKE2B-MOD: Decompose 64-bit word to 8 bytes (was 4 bytes in BLAKE2s)
         meta.create_gate("decompose word to bytes", |meta| {
             let word = meta.query_advice(advices[0], Rotation::next());
             let byte_1 = meta.query_advice(advices[0], Rotation::cur());
             let byte_2 = meta.query_advice(advices[1], Rotation::cur());
             let byte_3 = meta.query_advice(advices[2], Rotation::cur());
             let byte_4 = meta.query_advice(advices[3], Rotation::cur());
+            let byte_5 = meta.query_advice(advices[4], Rotation::cur());
+            let byte_6 = meta.query_advice(advices[5], Rotation::cur());
+            let byte_7 = meta.query_advice(advices[6], Rotation::cur());
+            let byte_8 = meta.query_advice(advices[7], Rotation::cur());
             let s_word_decompose = meta.query_selector(s_word_decompose);
 
             vec![
@@ -274,6 +289,10 @@ impl<F: PrimeField> Blake2sConfig<F> {
                         + byte_2 * F::from(1 << 8)
                         + byte_3 * F::from(1 << 16)
                         + byte_4 * F::from(1 << 24)
+                        + byte_5 * F::from(1u64 << 32)
+                        + byte_6 * F::from(1u64 << 40)
+                        + byte_7 * F::from(1u64 << 48)
+                        + byte_8 * F::from(1u64 << 56)
                         - word),
             ]
         });
@@ -337,13 +356,15 @@ impl<F: PrimeField> Blake2sConfig<F> {
             )
         });
 
+        // BLAKE2B-MOD: 64-bit modular addition (was 32-bit in BLAKE2s)
         meta.create_gate("word add", |meta| {
             let s_word_add = meta.query_selector(s_word_add);
             let lhs = meta.query_advice(advices[0], Rotation::cur());
             let rhs = meta.query_advice(advices[1], Rotation::cur());
             let out = meta.query_advice(advices[0], Rotation::next());
             let carry = meta.query_advice(advices[1], Rotation::next());
-            let equal = lhs + rhs - carry.clone() * F::from(1 << 32) - out;
+            // BLAKE2B-MOD: Use 2^64 for carry (was 2^32)
+            let equal = lhs + rhs - carry.clone() * F::from_u128(1u128 << 64) - out;
 
             Constraints::with_selector(
                 s_word_add,
@@ -354,20 +375,18 @@ impl<F: PrimeField> Blake2sConfig<F> {
             )
         });
 
-        meta.create_gate("encode four words to one field", |meta| {
+        // BLAKE2B-MOD: Encode two 64-bit words to one field (was four 32-bit words)
+        // Note: Pallas field is 255 bits, so we can fit 2 x 64-bit = 128 bits
+        meta.create_gate("encode two words to one field", |meta| {
             let field_element = meta.query_advice(advices[0], Rotation::next());
             let word_1 = meta.query_advice(advices[0], Rotation::cur());
             let word_2 = meta.query_advice(advices[1], Rotation::cur());
-            let word_3 = meta.query_advice(advices[2], Rotation::cur());
-            let word_4 = meta.query_advice(advices[3], Rotation::cur());
             let s_result_encode = meta.query_selector(s_result_encode);
 
             vec![
                 s_result_encode
                     * (word_1
-                        + word_2 * F::from(1 << 32)
-                        + word_3 * F::from_u128(1 << 64)
-                        + word_4 * F::from_u128(1 << 96)
+                        + word_2 * F::from_u128(1u128 << 64)
                         - field_element),
             ]
         });
@@ -483,7 +502,7 @@ impl<F: PrimeField> Blake2sConfig<F> {
             Constraints::with_selector(s_high_bit_zero, [("bit_254 * bit = 0", bit_254 * bit_to_check)])
         });
 
-        Blake2sConfig {
+        Blake2bConfig {
             advices,
             s_field_decompose,
             s_word_decompose,
@@ -498,9 +517,9 @@ impl<F: PrimeField> Blake2sConfig<F> {
     }
 }
 
-impl<F: PrimeField> Blake2sChip<F> {
+impl<F: PrimeField> Blake2bChip<F> {
     /// Construct a new BLAKE2s chip from the given config.
-    pub fn construct(config: Blake2sConfig<F>) -> Self {
+    pub fn construct(config: Blake2bConfig<F>) -> Self {
         Self {
             config,
             _marker: PhantomData,
@@ -508,87 +527,102 @@ impl<F: PrimeField> Blake2sChip<F> {
     }
 
     /// Process the inputs and return the hash result as 8 words.
+    /// BLAKE2B-MOD: Process with 16-byte personalization and 64-byte output.
     ///
     /// # Arguments
     /// * `layouter` - The circuit layouter
     /// * `inputs` - The input field elements (must be even length)
-    /// * `personalization` - 8-byte personalization string
+    /// * `personalization` - 16-byte personalization string (was 8 bytes in BLAKE2s)
     pub fn process(
         &self,
         layouter: &mut impl Layouter<F>,
         inputs: &[AssignedCell<F, F>],
         personalization: &[u8],
-    ) -> Result<Vec<Blake2sWord<F>>, Error> {
-        assert_eq!(personalization.len(), 8);
+    ) -> Result<Vec<Blake2bWord<F>>, Error> {
+        // BLAKE2B-MOD: 16-byte personalization (was 8 bytes in BLAKE2s)
+        assert_eq!(personalization.len(), 16);
         assert!(inputs.len() % 2 == 0);
 
-        // Init
+        // Init - BLAKE2B-MOD: 64-byte output length (was 32)
         let mut h = vec![
-            Blake2sWord::from_constant_u32(IV[0] ^ 0x01010000 ^ 32, layouter, self)?,
-            Blake2sWord::from_constant_u32(IV[1], layouter, self)?,
-            Blake2sWord::from_constant_u32(IV[2], layouter, self)?,
-            Blake2sWord::from_constant_u32(IV[3], layouter, self)?,
-            Blake2sWord::from_constant_u32(IV[4], layouter, self)?,
-            Blake2sWord::from_constant_u32(IV[5], layouter, self)?,
-            Blake2sWord::from_constant_u32(
-                IV[6] ^ LittleEndian::read_u32(&personalization[0..4]),
+            Blake2bWord::from_constant_u64(IV[0] ^ 0x01010000 ^ 64, layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[1], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[2], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[3], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[4], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[5], layouter, self)?,
+            // BLAKE2B-MOD: Read u64 for personalization (was u32)
+            Blake2bWord::from_constant_u64(
+                IV[6] ^ LittleEndian::read_u64(&personalization[0..8]),
                 layouter,
                 self,
             )?,
-            Blake2sWord::from_constant_u32(
-                IV[7] ^ LittleEndian::read_u32(&personalization[4..8]),
+            Blake2bWord::from_constant_u64(
+                IV[7] ^ LittleEndian::read_u64(&personalization[8..16]),
                 layouter,
                 self,
             )?,
         ];
 
-        // Handle message: convert field message to blocks.
+        // BLAKE2B-MOD: Handle message - convert field elements to 128-byte blocks.
+        // Each field element (32 bytes) provides 4 x 64-bit words.
+        // BLAKE2b block = 128 bytes = 16 x 64-bit words = 4 field elements.
         let mut blocks = vec![];
-        for block in inputs.chunks(2) {
+        for block_fields in inputs.chunks(4) {
             let mut cur_block = Vec::with_capacity(16);
-            for field in block.iter() {
+            for field in block_fields.iter() {
                 let mut words = self.field_decompose(layouter, field)?;
                 cur_block.append(&mut words);
+            }
+            // Pad with zeros if we don't have 16 words (partial last block)
+            while cur_block.len() < 16 {
+                cur_block.push(Blake2bWord::from_constant_u64(0, layouter, self)?);
             }
             blocks.push(cur_block);
         }
 
         if blocks.is_empty() {
+            // Empty input - use zero padding block
             let zero_padding_block = (0..16)
-                .map(|_| Blake2sWord::from_constant_u32(0, layouter, self).unwrap())
+                .map(|_| Blake2bWord::from_constant_u64(0, layouter, self).unwrap())
                 .collect();
             blocks.push(zero_padding_block);
         }
 
         let block_len = blocks.len();
 
+        // BLAKE2B-MOD: Block size is 128 bytes
         for (i, block) in blocks[0..(block_len - 1)].iter().enumerate() {
-            self.compress(layouter, &mut h, block, (i as u64 + 1) * 64, false)?;
+            self.compress(layouter, &mut h, block, (i as u128 + 1) * 128, false)?;
         }
 
         // Compress(Final block)
+        // Note: t = total bytes processed, not block count
+        let total_bytes = inputs.len() as u128 * 32;  // Each field is 32 bytes
         self.compress(
             layouter,
             &mut h,
             &blocks[block_len - 1],
-            (block_len as u64) * 64,
+            total_bytes.max(128),  // At minimum one 128-byte block
             true,
         )?;
 
         Ok(h)
     }
 
-    /// Encode the eight words to two field elements.
+    /// BLAKE2B-MOD: Encode the eight 64-bit words to four field elements.
+    /// (was two field elements from eight 32-bit words in BLAKE2s)
     pub fn encode_result(
         &self,
         layouter: &mut impl Layouter<F>,
-        ret: &[Blake2sWord<F>],
-    ) -> Result<[AssignedCell<F, F>; 2], Error> {
+        ret: &[Blake2bWord<F>],
+    ) -> Result<[AssignedCell<F, F>; 4], Error> {
         let mut fields = vec![];
         assert_eq!(ret.len(), 8);
-        for words in ret.chunks(4) {
+        // BLAKE2B-MOD: Encode pairs of 64-bit words (128 bits) per field
+        for words in ret.chunks(2) {
             let field = layouter.assign_region(
-                || "encode four words to one field",
+                || "encode two words to one field",
                 |mut region| {
                     self.config.s_result_encode.enable(&mut region, 0)?;
                     for (i, word) in words.iter().enumerate() {
@@ -601,11 +635,12 @@ impl<F: PrimeField> Blake2sChip<F> {
                     }
                     let word_values: Value<Vec<_>> =
                         words.iter().map(|word| word.get_word().value()).collect();
+                    // BLAKE2B-MOD: Use 2^64 multiplier (was 2^32)
                     let field_value = word_values.map(|words| {
                         words
                             .into_iter()
                             .rev()
-                            .fold(F::ZERO, |acc, byte| acc * F::from(1 << 32) + byte)
+                            .fold(F::ZERO, |acc, word| acc * F::from_u128(1u128 << 64) + word)
                     });
                     region.assign_advice(
                         || "result field",
@@ -617,7 +652,7 @@ impl<F: PrimeField> Blake2sChip<F> {
             )?;
             fields.push(field);
         }
-        assert_eq!(fields.len(), 2);
+        assert_eq!(fields.len(), 4);
         Ok(fields.try_into().unwrap())
     }
 
@@ -666,45 +701,48 @@ impl<F: PrimeField> Blake2sChip<F> {
     ///     |      RETURN h[0..7]                  // New state.
     ///     |
     ///     END FUNCTION.
+    /// BLAKE2B-MOD: Uses 128-bit counter t (was 64-bit in BLAKE2s)
     fn compress(
         &self,
         layouter: &mut impl Layouter<F>,
-        h: &mut [Blake2sWord<F>], // current state
-        m: &[Blake2sWord<F>],     // current block
-        t: u64,                   // offset counter
+        h: &mut [Blake2bWord<F>], // current state
+        m: &[Blake2bWord<F>],     // current block
+        t: u128,                  // BLAKE2B-MOD: 128-bit offset counter (was 64-bit)
         f: bool,                  // final flag
     ) -> Result<(), Error> {
         let mut v = Vec::with_capacity(16);
         v.extend_from_slice(h);
         for iv in IV[0..4].iter() {
-            let word = Blake2sWord::from_constant_u32(*iv, layouter, self)?;
+            let word = Blake2bWord::from_constant_u64(*iv, layouter, self)?;
             v.push(word);
         }
-        // v[12] := v[12] ^ (t mod 2**w)
-        let v_12 = Blake2sWord::from_constant_u32(IV[4] ^ (t as u32), layouter, self)?;
+        // BLAKE2B-MOD: v[12] := v[12] ^ (t mod 2**64) - uses 64-bit low word
+        let v_12 = Blake2bWord::from_constant_u64(IV[4] ^ (t as u64), layouter, self)?;
         v.push(v_12);
 
-        // v[13] := v[13] ^ (t >> w)
-        let v_13 = Blake2sWord::from_constant_u32(IV[5] ^ ((t >> 32) as u32), layouter, self)?;
+        // BLAKE2B-MOD: v[13] := v[13] ^ (t >> 64) - uses 64-bit high word
+        let v_13 = Blake2bWord::from_constant_u64(IV[5] ^ ((t >> 64) as u64), layouter, self)?;
         v.push(v_13);
 
         // IF f = TRUE THEN                // last block flag?
         // |   v[14] := v[14] ^ 0xFF..FF   // Invert all bits.
         // END IF.
+        // BLAKE2B-MOD: Use u64::MAX (was u32::MAX)
         let v_14 = if f {
-            Blake2sWord::from_constant_u32(IV[6] ^ u32::MAX, layouter, self)?
+            Blake2bWord::from_constant_u64(IV[6] ^ u64::MAX, layouter, self)?
         } else {
-            Blake2sWord::from_constant_u32(IV[6], layouter, self)?
+            Blake2bWord::from_constant_u64(IV[6], layouter, self)?
         };
         v.push(v_14);
 
         // v_15
-        let v_15 = Blake2sWord::from_constant_u32(IV[7], layouter, self)?;
+        let v_15 = Blake2bWord::from_constant_u64(IV[7], layouter, self)?;
         v.push(v_15);
         assert_eq!(v.len(), 16);
 
         for i in 0..ROUNDS {
-            let s = SIGMA[i % ROUNDS];
+            // SIGMA only has 10 permutations, so we cycle through them
+            let s = SIGMA[i % 10];
             self.g(
                 layouter.namespace(|| "mixing 1"),
                 &mut v,
@@ -776,7 +814,7 @@ impl<F: PrimeField> Blake2sChip<F> {
                 &h_i_bits,
                 v[i + 8].get_bits(),
             )?;
-            h[i] = Blake2sWord::from_bits(
+            h[i] = Blake2bWord::from_bits(
                 self,
                 layouter.namespace(|| "construct word from bits"),
                 h_i_bits,
@@ -808,21 +846,21 @@ impl<F: PrimeField> Blake2sChip<F> {
     fn g(
         &self,
         mut layouter: impl Layouter<F>,
-        v: &mut [Blake2sWord<F>],
+        v: &mut [Blake2bWord<F>],
         (a, b, c, d): (usize, usize, usize, usize),
-        x: &Blake2sWord<F>,
-        y: &Blake2sWord<F>,
+        x: &Blake2bWord<F>,
+        y: &Blake2bWord<F>,
     ) -> Result<(), Error> {
         // v[a] := (v[a] + v[b] + x) mod 2**w
         v[a] = {
-            let sum_a_b = self.add_mod_u32(
-                layouter.namespace(|| "add_mod_u32"),
+            let sum_a_b = self.add_mod_u64(
+                layouter.namespace(|| "add_mod_u64"),
                 v[a].get_word(),
                 v[b].get_word(),
             )?;
             let sum_a_b_x =
-                self.add_mod_u32(layouter.namespace(|| "add_mod_u32"), &sum_a_b, x.get_word())?;
-            Blake2sWord::from_word(self, layouter.namespace(|| "from word"), sum_a_b_x)?
+                self.add_mod_u64(layouter.namespace(|| "add_mod_u64"), &sum_a_b, x.get_word())?;
+            Blake2bWord::from_word(self, layouter.namespace(|| "from word"), sum_a_b_x)?
         };
 
         // v[d] := (v[d] ^ v[a]) >>> R1
@@ -832,18 +870,18 @@ impl<F: PrimeField> Blake2sChip<F> {
                 v[d].get_bits(),
                 v[a].get_bits(),
             )?;
-            let bits = Blake2sWord::word_rotate(&d_xor_a, R1);
-            Blake2sWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
+            let bits = Blake2bWord::word_rotate(&d_xor_a, R1);
+            Blake2bWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
         };
 
         // v[c] := (v[c] + v[d])     mod 2**w
         v[c] = {
-            let sum = self.add_mod_u32(
-                layouter.namespace(|| "add_mod_u32"),
+            let sum = self.add_mod_u64(
+                layouter.namespace(|| "add_mod_u64"),
                 v[c].get_word(),
                 v[d].get_word(),
             )?;
-            Blake2sWord::from_word(self, layouter.namespace(|| "from word"), sum)?
+            Blake2bWord::from_word(self, layouter.namespace(|| "from word"), sum)?
         };
 
         // v[b] := (v[b] ^ v[c]) >>> R2
@@ -853,20 +891,20 @@ impl<F: PrimeField> Blake2sChip<F> {
                 v[b].get_bits(),
                 v[c].get_bits(),
             )?;
-            let bits = Blake2sWord::word_rotate(&b_xor_c, R2);
-            Blake2sWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
+            let bits = Blake2bWord::word_rotate(&b_xor_c, R2);
+            Blake2bWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
         };
 
         // v[a] := (v[a] + v[b] + y) mod 2**w
         v[a] = {
-            let sum_a_b = self.add_mod_u32(
-                layouter.namespace(|| "add_mod_u32"),
+            let sum_a_b = self.add_mod_u64(
+                layouter.namespace(|| "add_mod_u64"),
                 v[a].get_word(),
                 v[b].get_word(),
             )?;
             let sum_a_b_y =
-                self.add_mod_u32(layouter.namespace(|| "add_mod_u32"), &sum_a_b, y.get_word())?;
-            Blake2sWord::from_word(self, layouter.namespace(|| "from word"), sum_a_b_y)?
+                self.add_mod_u64(layouter.namespace(|| "add_mod_u64"), &sum_a_b, y.get_word())?;
+            Blake2bWord::from_word(self, layouter.namespace(|| "from word"), sum_a_b_y)?
         };
 
         // v[d] := (v[d] ^ v[a]) >>> R3
@@ -876,18 +914,18 @@ impl<F: PrimeField> Blake2sChip<F> {
                 v[d].get_bits(),
                 v[a].get_bits(),
             )?;
-            let bits = Blake2sWord::word_rotate(&d_xor_a, R3);
-            Blake2sWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
+            let bits = Blake2bWord::word_rotate(&d_xor_a, R3);
+            Blake2bWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
         };
 
         // v[c] := (v[c] + v[d])     mod 2**w
         v[c] = {
-            let sum = self.add_mod_u32(
-                layouter.namespace(|| "add_mod_u32"),
+            let sum = self.add_mod_u64(
+                layouter.namespace(|| "add_mod_u64"),
                 v[c].get_word(),
                 v[d].get_word(),
             )?;
-            Blake2sWord::from_word(self, layouter.namespace(|| "from word"), sum)?
+            Blake2bWord::from_word(self, layouter.namespace(|| "from word"), sum)?
         };
 
         // v[b] := (v[b] ^ v[c]) >>> R4
@@ -897,8 +935,8 @@ impl<F: PrimeField> Blake2sChip<F> {
                 v[b].get_bits(),
                 v[c].get_bits(),
             )?;
-            let bits = Blake2sWord::word_rotate(&b_xor_c, R4);
-            Blake2sWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
+            let bits = Blake2bWord::word_rotate(&b_xor_c, R4);
+            Blake2bWord::from_bits(self, layouter.namespace(|| "from bits"), bits)?
         };
 
         Ok(())
@@ -909,20 +947,21 @@ impl<F: PrimeField> Blake2sChip<F> {
         &self,
         layouter: &mut impl Layouter<F>,
         field: &AssignedCell<F, F>,
-    ) -> Result<Vec<Blake2sWord<F>>, Error> {
+    ) -> Result<Vec<Blake2bWord<F>>, Error> {
         // the decomposition from bytes to bits
         let mut bits = vec![];
         let mut bytes = vec![];
         for i in 0..32 {
             let byte_value = field.value().map(|f| f.to_repr().as_ref()[i]);
             let byte =
-                Blake2sByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &self.config)?;
+                Blake2bByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &self.config)?;
             bits.append(&mut byte.get_bits().to_vec());
             bytes.push(byte.get_byte());
         }
 
-        // Check the decomposition from words to bytes
-        let mut words = vec![];
+        // Check the decomposition from 32-bit words to bytes
+        // Note: We use 32-bit words here for field decomposition gate and canonicality check
+        let mut words_32 = vec![];
         for bytes in bytes.chunks(4) {
             let word = {
                 let byte_values: Value<Vec<_>> = bytes.iter().map(|byte| byte.value()).collect();
@@ -938,16 +977,16 @@ impl<F: PrimeField> Blake2sChip<F> {
                     word_value,
                 )?
             };
-            self.word_decompose(layouter.namespace(|| "word decompose"), bytes, &word)?;
-            words.push(word);
+            self.word_decompose_32(layouter.namespace(|| "word decompose"), bytes, &word)?;
+            words_32.push(word);
         }
 
-        // check the decomposition from field to words
+        // check the decomposition from field to 32-bit words
         layouter.assign_region(
             || "decompose field to words",
             |mut region| {
                 self.config.s_field_decompose.enable(&mut region, 0)?;
-                for (i, word) in words.iter().enumerate() {
+                for (i, word) in words_32.iter().enumerate() {
                     word.copy_advice(|| "word", &mut region, self.config.advices[i], 0)?;
                 }
                 field.copy_advice(|| "field", &mut region, self.config.advices[0], 1)?;
@@ -959,16 +998,28 @@ impl<F: PrimeField> Blake2sChip<F> {
         // Ensure the 256-bit decomposition represents a value strictly less than p.
         // Without this, a prover could use the non-canonical representation (value + p).
         // We pass both the bits (for direct bit constraints) and words (for lower_128 computation).
-        self.check_canonicality(layouter, &bits, &words)?;
+        self.check_canonicality(layouter, &bits, &words_32)?;
 
-        let res = bits
-            .chunks(32)
-            .zip(words)
-            .map(|(bits, word)| Blake2sWord {
-                word,
-                bits: bits.to_vec().try_into().unwrap(),
-            })
-            .collect::<Vec<_>>();
+        // BLAKE2B-MOD: Create 64-bit Blake2bWords by combining pairs of 32-bit bit chunks
+        // We get 4 x 64-bit words from a 256-bit field element
+        let mut res = Vec::with_capacity(4);
+        for (i, chunk) in bits.chunks(64).enumerate() {
+            // Combine two adjacent 32-bit words into one 64-bit word
+            let word_64 = {
+                let w1 = words_32[i * 2].value();
+                let w2 = words_32[i * 2 + 1].value();
+                let word_value = w1.zip(w2).map(|(&lo, &hi)| lo + hi * F::from(1u64 << 32));
+                assign_free_advice(
+                    layouter.namespace(|| format!("64-bit word {}", i)),
+                    self.config.advices[8],
+                    word_value,
+                )?
+            };
+            res.push(Blake2bWord {
+                word: word_64,
+                bits: chunk.to_vec().try_into().unwrap(),
+            });
+        }
 
         Ok(res)
     }
@@ -1113,7 +1164,7 @@ impl<F: PrimeField> Blake2sChip<F> {
             let mut diff_bytes = Vec::with_capacity(4);
             for j in 0..4 {
                 let byte_val = dw_val.map(|w| ((w >> (j * 8)) & 0xFF) as u8);
-                let byte = Blake2sByte::from_u8(
+                let byte = Blake2bByte::from_u8(
                     byte_val,
                     layouter.namespace(|| format!("diff_word_{}_byte_{}", i, j)),
                     &self.config,
@@ -1123,7 +1174,8 @@ impl<F: PrimeField> Blake2sChip<F> {
 
             // Use the SAME diff_word cell from the canonicality region
             // This ensures the range-checked word is the same as the one in the constraint
-            self.word_decompose(
+            // Note: diff_words are 32-bit for canonicality check
+            self.word_decompose_32(
                 layouter.namespace(|| format!("diff_word_{}_decompose", i)),
                 &diff_bytes,
                 dw_cell,
@@ -1133,8 +1185,9 @@ impl<F: PrimeField> Blake2sChip<F> {
         Ok(())
     }
 
-    /// Decompose a word to four bytes.
-    fn word_decompose(
+    /// Decompose a 32-bit word to 4 bytes (used for field decomposition and canonicality).
+    /// This is kept for compatibility with the field decomposition gate which operates on 32-bit words.
+    fn word_decompose_32(
         &self,
         mut layouter: impl Layouter<F>,
         bytes: &[AssignedCell<F, F>],
@@ -1142,7 +1195,39 @@ impl<F: PrimeField> Blake2sChip<F> {
     ) -> Result<(), Error> {
         assert_eq!(bytes.len(), 4);
         layouter.assign_region(
-            || "decompose word to bytes",
+            || "decompose 32-bit word to bytes",
+            |mut region| {
+                // Note: We use a subset of the s_word_decompose gate (first 4 bytes)
+                // The gate supports up to 8 bytes but we only use 4 here
+                self.config.s_word_decompose.enable(&mut region, 0)?;
+                for (i, byte) in bytes.iter().enumerate() {
+                    byte.copy_advice(|| "byte", &mut region, self.config.advices[i], 0)?;
+                }
+                // Zero out unused bytes (5-8) for the gate constraint
+                for i in 4..8 {
+                    region.assign_advice_from_constant(
+                        || format!("zero byte {}", i),
+                        self.config.advices[i],
+                        0,
+                        F::ZERO,
+                    )?;
+                }
+                word.copy_advice(|| "word", &mut region, self.config.advices[0], 1)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// BLAKE2B-MOD: Decompose a 64-bit word to eight bytes (for BLAKE2b operations).
+    fn word_decompose(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bytes: &[AssignedCell<F, F>],
+        word: &AssignedCell<F, F>,
+    ) -> Result<(), Error> {
+        assert_eq!(bytes.len(), 8);
+        layouter.assign_region(
+            || "decompose 64-bit word to bytes",
             |mut region| {
                 self.config.s_word_decompose.enable(&mut region, 0)?;
                 for (i, byte) in bytes.iter().enumerate() {
@@ -1212,15 +1297,16 @@ impl<F: PrimeField> Blake2sChip<F> {
         )
     }
 
+    /// BLAKE2B-MOD: XOR 64-bit words (was 32-bit in BLAKE2s)
     fn word_xor(
         &self,
         mut layouter: impl Layouter<F>,
         x: &[AssignedCell<F, F>],
         y: &[AssignedCell<F, F>],
     ) -> Result<Vec<AssignedCell<F, F>>, Error> {
-        assert_eq!(x.len(), 32);
-        assert_eq!(y.len(), 32);
-        let mut bits = Vec::with_capacity(32);
+        assert_eq!(x.len(), 64);  // BLAKE2B-MOD: 64 bits (was 32)
+        assert_eq!(y.len(), 64);  // BLAKE2B-MOD: 64 bits (was 32)
+        let mut bits = Vec::with_capacity(64);
         for (x_byte, y_byte) in x.chunks(8).zip(y.chunks(8)) {
             let mut ret = self.byte_xor(layouter.namespace(|| "byte xor"), x_byte, y_byte)?;
             bits.append(&mut ret);
@@ -1229,7 +1315,8 @@ impl<F: PrimeField> Blake2sChip<F> {
         Ok(bits)
     }
 
-    fn add_mod_u32(
+    /// BLAKE2B-MOD: 64-bit modular addition (was 32-bit add_mod_u64 in BLAKE2s)
+    fn add_mod_u64(
         &self,
         mut layouter: impl Layouter<F>,
         // x and y must be a word variable
@@ -1237,15 +1324,16 @@ impl<F: PrimeField> Blake2sChip<F> {
         y: &AssignedCell<F, F>,
     ) -> Result<AssignedCell<F, F>, Error> {
         layouter.assign_region(
-            || "decompose bytes to bits",
+            || "64-bit word add",
             |mut region| {
                 self.config.s_word_add.enable(&mut region, 0)?;
                 x.copy_advice(|| "word_add x", &mut region, self.config.advices[0], 0)?;
                 y.copy_advice(|| "word_add y", &mut region, self.config.advices[1], 0)?;
                 let sum = x.value().zip(y.value()).map(|(&x, &y)| {
                     let sum = x + y;
-                    let carry = F::from(sum.to_repr().as_ref()[4] as u64);
-                    let ret = sum - carry * F::from(1 << 32);
+                    // BLAKE2B-MOD: Check byte 8 for 64-bit overflow (was byte 4 for 32-bit)
+                    let carry = F::from(sum.to_repr().as_ref()[8] as u64);
+                    let ret = sum - carry * F::from_u128(1u128 << 64);
                     (ret, carry)
                 });
                 let ret = region.assign_advice(
@@ -1266,19 +1354,19 @@ impl<F: PrimeField> Blake2sChip<F> {
     }
 }
 
-impl<F: PrimeField> Blake2sWord<F> {
-    /// Create a Blake2sWord from a constant u32 value.
-    pub fn from_constant_u32(
-        value: u32,
+impl<F: PrimeField> Blake2bWord<F> {
+    /// BLAKE2B-MOD: Create a Blake2bWord from a constant u64 value (was u32 in BLAKE2s).
+    pub fn from_constant_u64(
+        value: u64,
         layouter: &mut impl Layouter<F>,
-        chip: &Blake2sChip<F>,
+        chip: &Blake2bChip<F>,
     ) -> Result<Self, Error> {
-        let mut bytes = Vec::with_capacity(4);
-        let mut word_bits = Vec::with_capacity(32);
+        let mut bytes = Vec::with_capacity(8);  // BLAKE2B-MOD: 8 bytes (was 4)
+        let mut word_bits = Vec::with_capacity(64);  // BLAKE2B-MOD: 64 bits (was 32)
         let mut tmp = value;
-        for _ in 0..4 {
+        for _ in 0..8 {  // BLAKE2B-MOD: 8 iterations (was 4)
             let input_byte = tmp as u8;
-            let byte = Blake2sByte::from_constant_u8(input_byte, layouter, &chip.config)?;
+            let byte = Blake2bByte::from_constant_u8(input_byte, layouter, &chip.config)?;
             bytes.push(byte.get_byte());
             word_bits.append(&mut byte.get_bits().to_vec());
             tmp >>= 8;
@@ -1286,7 +1374,7 @@ impl<F: PrimeField> Blake2sWord<F> {
         let word = assign_free_constant(
             layouter.namespace(|| "constant word"),
             chip.config.advices[0],
-            F::from(value as u64),
+            F::from(value),  // BLAKE2B-MOD: u64 fits directly in F
         )?;
         chip.word_decompose(layouter.namespace(|| "word decompose"), &bytes, &word)?;
         Ok(Self {
@@ -1295,39 +1383,39 @@ impl<F: PrimeField> Blake2sWord<F> {
         })
     }
 
-    /// Rotate word bits to the right by `by` positions.
+    /// BLAKE2B-MOD: Rotate 64-bit word bits to the right by `by` positions (was 32-bit).
     pub fn word_rotate(bits: &[AssignedCell<F, F>], by: usize) -> Vec<AssignedCell<F, F>> {
-        assert!(bits.len() == 32);
-        let by = by % 32;
+        assert!(bits.len() == 64);  // BLAKE2B-MOD: 64 bits (was 32)
+        let by = by % 64;
         bits.iter()
             .skip(by)
             .chain(bits.iter())
-            .take(32)
+            .take(64)  // BLAKE2B-MOD: 64 bits (was 32)
             .cloned()
             .collect()
     }
 
-    /// Shift word bits to the right by `by` positions (with zero fill).
+    /// BLAKE2B-MOD: Shift 64-bit word bits to the right by `by` positions (was 32-bit).
     pub fn shift(
         &self,
         by: usize,
         mut layouter: impl Layouter<F>,
         advice: Column<Advice>,
     ) -> Result<Vec<AssignedCell<F, F>>, Error> {
-        let by = by % 32;
+        let by = by % 64;  // BLAKE2B-MOD: 64 bits (was 32)
         let padding_zero = assign_free_constant(layouter.namespace(|| "zero"), advice, F::from(0))?;
         let old_bits = self.get_bits();
         Ok(old_bits
             .iter()
             .skip(by)
             .chain(Some(&padding_zero).into_iter().cycle())
-            .take(32)
+            .take(64)  // BLAKE2B-MOD: 64 bits (was 32)
             .cloned()
             .collect())
     }
 
-    /// Get the bits of this word.
-    pub fn get_bits(&self) -> &[AssignedCell<F, F>; 32] {
+    /// BLAKE2B-MOD: Get the 64 bits of this word (was 32 bits in BLAKE2s).
+    pub fn get_bits(&self) -> &[AssignedCell<F, F>; 64] {
         &self.bits
     }
 
@@ -1336,14 +1424,14 @@ impl<F: PrimeField> Blake2sWord<F> {
         &self.word
     }
 
-    /// Create a Blake2sWord from bits.
+    /// BLAKE2B-MOD: Create a Blake2bWord from 64 bits (was 32 bits in BLAKE2s).
     pub fn from_bits(
-        chip: &Blake2sChip<F>,
+        chip: &Blake2bChip<F>,
         mut layouter: impl Layouter<F>,
         bits: Vec<AssignedCell<F, F>>,
     ) -> Result<Self, Error> {
-        assert!(bits.len() == 32);
-        let mut bytes = Vec::with_capacity(4);
+        assert!(bits.len() == 64);  // BLAKE2B-MOD: 64 bits (was 32)
+        let mut bytes = Vec::with_capacity(8);  // BLAKE2B-MOD: 8 bytes (was 4)
         for bits in bits.chunks(8) {
             let bit_values: Value<Vec<_>> = bits.iter().map(|bit| bit.value()).collect();
             let byte_value = bit_values.map(|bits| {
@@ -1380,18 +1468,18 @@ impl<F: PrimeField> Blake2sWord<F> {
         })
     }
 
-    /// Create a Blake2sWord from an assigned word.
+    /// BLAKE2B-MOD: Create a Blake2bWord from an assigned 64-bit word (was 32-bit in BLAKE2s).
     pub fn from_word(
-        chip: &Blake2sChip<F>,
+        chip: &Blake2bChip<F>,
         mut layouter: impl Layouter<F>,
         word: AssignedCell<F, F>,
     ) -> Result<Self, Error> {
-        let mut bytes = Vec::with_capacity(4);
-        let mut bits = Vec::with_capacity(32);
-        for i in 0..4 {
+        let mut bytes = Vec::with_capacity(8);  // BLAKE2B-MOD: 8 bytes (was 4)
+        let mut bits = Vec::with_capacity(64);  // BLAKE2B-MOD: 64 bits (was 32)
+        for i in 0..8 {  // BLAKE2B-MOD: 8 iterations (was 4)
             let byte_value = word.value().map(|v| v.to_repr().as_ref()[i]);
             let byte =
-                Blake2sByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &chip.config)?;
+                Blake2bByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &chip.config)?;
             bits.append(&mut byte.get_bits().to_vec());
             bytes.push(byte.get_byte());
         }
@@ -1415,13 +1503,13 @@ mod tests {
     use pasta_curves::pallas;
 
     #[derive(Default)]
-    struct Blake2sTestCircuit {
+    struct Blake2bTestCircuit {
         input1: Value<pallas::Base>,
         input2: Value<pallas::Base>,
     }
 
-    impl Circuit<pallas::Base> for Blake2sTestCircuit {
-        type Config = Blake2sConfig<pallas::Base>;
+    impl Circuit<pallas::Base> for Blake2bTestCircuit {
+        type Config = Blake2bConfig<pallas::Base>;
         type FloorPlanner = floor_planner::V1;
 
         fn without_witnesses(&self) -> Self {
@@ -1448,7 +1536,7 @@ mod tests {
 
             let constants = meta.fixed_column();
             meta.enable_constant(constants);
-            Blake2sConfig::configure(meta, advices)
+            Blake2bConfig::configure(meta, advices)
         }
 
         fn synthesize(
@@ -1468,11 +1556,12 @@ mod tests {
                 self.input2,
             )?;
 
-            let blake2s_chip = Blake2sChip::construct(config);
-            let _result = blake2s_chip.process(
+            let blake2b_chip = Blake2bChip::construct(config);
+            // BLAKE2B-MOD: 16-byte personalization (was 8 bytes in BLAKE2s)
+            let _result = blake2b_chip.process(
                 &mut layouter,
                 &[input1, input2],
-                b"ZcshTest", // 8-byte personalization
+                b"ZcshBlake2bTest!", // 16-byte personalization
             )?;
 
             Ok(())
@@ -1480,13 +1569,14 @@ mod tests {
     }
 
     #[test]
-    fn test_blake2s_circuit() {
-        let circuit = Blake2sTestCircuit {
+    fn test_blake2b_circuit() {
+        let circuit = Blake2bTestCircuit {
             input1: Value::known(pallas::Base::from(1u64)),
             input2: Value::known(pallas::Base::from(2u64)),
         };
 
-        let k = 14;
+        // BLAKE2B-MOD: Increased k from 14 to 17 due to larger 64-bit circuit
+        let k = 17;
         let prover = MockProver::run(k, &circuit, vec![]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }

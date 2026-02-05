@@ -217,9 +217,13 @@ mod reference {
 
     /// Compute BLAKE2b hash matching the circuit's input format
     /// Input: field element bytes (32 bytes each), personalization (16 bytes)
+    ///
+    /// BLAKE2b uses 128-byte blocks. The circuit processes inputs in chunks of 4 field
+    /// elements (4 * 32 = 128 bytes) per block. Each field element provides 4 x 64-bit
+    /// words, so one block = 4 fields = 16 x 64-bit words = 128 bytes.
     pub fn blake2b_hash(inputs: &[&[u8; 32]], personalization: &[u8; 16]) -> [u64; 8] {
         // Initialize state with personalization
-        // BLAKE2B-MOD: 64-byte output length (was 32 in BLAKE2s)
+        // BLAKE2B-MOD: 64-byte output length
         let mut h = [
             IV[0] ^ 0x01010000 ^ 64,
             IV[1],
@@ -232,26 +236,27 @@ mod reference {
         ];
 
         // Convert inputs to message blocks
-        // Note: For compatibility with the circuit's field decomposition,
-        // we keep 64-byte (512-bit) blocks even though BLAKE2b typically uses 128-byte blocks
+        // BLAKE2b block = 128 bytes = 16 x 64-bit words = 4 field elements
         let mut all_bytes = Vec::new();
         for input in inputs {
             all_bytes.extend_from_slice(*input);
         }
 
-        // Pad to multiple of 64 bytes (matching circuit's block handling)
+        // Total input bytes (used for final block counter)
+        let total_input_bytes = all_bytes.len();
+
+        // Pad to multiple of 128 bytes (BLAKE2b block size)
         if all_bytes.is_empty() {
-            all_bytes.resize(64, 0);
-        } else if all_bytes.len() % 64 != 0 {
-            let padding = 64 - (all_bytes.len() % 64);
+            all_bytes.resize(128, 0);
+        } else if all_bytes.len() % 128 != 0 {
+            let padding = 128 - (all_bytes.len() % 128);
             all_bytes.resize(all_bytes.len() + padding, 0);
         }
 
-        let num_blocks = all_bytes.len() / 64;
+        let num_blocks = all_bytes.len() / 128;
 
-        for (block_idx, chunk) in all_bytes.chunks(64).enumerate() {
-            // Read as 8 x 64-bit words (but we only have 64 bytes = 8 words)
-            // Pad to 16 words with zeros for the message schedule
+        for (block_idx, chunk) in all_bytes.chunks(128).enumerate() {
+            // Read 16 x 64-bit words from 128-byte block
             let mut m = [0u64; 16];
             for (i, word_bytes) in chunk.chunks(8).enumerate() {
                 if word_bytes.len() == 8 {
@@ -263,8 +268,16 @@ mod reference {
                     m[i] = LittleEndian::read_u64(&padded);
                 }
             }
-            let t = ((block_idx + 1) * 64) as u128;
+
             let is_last = block_idx == num_blocks - 1;
+            // Counter: bytes processed so far
+            // - Intermediate blocks: (block_idx + 1) * 128
+            // - Final block: total_input_bytes.max(128) to match circuit's handling
+            let t = if is_last {
+                (total_input_bytes.max(128)) as u128
+            } else {
+                ((block_idx + 1) * 128) as u128
+            };
             compress(&mut h, &m, t, is_last);
         }
 

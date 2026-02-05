@@ -135,6 +135,8 @@ pub struct Blake2bConfig<F: PrimeField> {
     pub s_canonicality: Selector,
     /// Selector for high bit zero check (bit_254 * bit = 0 for bits 128-253).
     pub s_high_bit_zero: Selector,
+    /// BLAKE2B-MOD: Selector for combining two 32-bit words into one 64-bit word.
+    pub s_word_combine: Selector,
     _marker: PhantomData<F>,
 }
 
@@ -243,6 +245,7 @@ impl<F: PrimeField> Blake2bConfig<F> {
         let s_result_encode = meta.selector();
         let s_canonicality = meta.selector();
         let s_high_bit_zero = meta.selector();
+        let s_word_combine = meta.selector();
 
         meta.create_gate("decompose field to words", |meta| {
             let field_element = meta.query_advice(advices[0], Rotation::next());
@@ -502,6 +505,31 @@ impl<F: PrimeField> Blake2bConfig<F> {
             Constraints::with_selector(s_high_bit_zero, [("bit_254 * bit = 0", bit_254 * bit_to_check)])
         });
 
+        // BLAKE2B-MOD: WORD COMBINE GATE
+        //
+        // This gate constrains a 64-bit word to equal the combination of two 32-bit words:
+        // word_64 = word_32_lo + word_32_hi * 2^32
+        //
+        // This is critical for soundness in field_decompose where we convert the
+        // 8 x 32-bit words (used for canonicality check) into 4 x 64-bit words
+        // (used for BLAKE2b operations).
+        //
+        // Layout (2 rows):
+        // Row 0: word_32_lo, word_32_hi
+        // Row 1: word_64
+        meta.create_gate("combine two 32-bit words to 64-bit", |meta| {
+            let s_word_combine = meta.query_selector(s_word_combine);
+
+            let word_32_lo = meta.query_advice(advices[0], Rotation::cur());
+            let word_32_hi = meta.query_advice(advices[1], Rotation::cur());
+            let word_64 = meta.query_advice(advices[0], Rotation::next());
+
+            vec![
+                s_word_combine
+                    * (word_32_lo + word_32_hi * F::from(1u64 << 32) - word_64),
+            ]
+        });
+
         Blake2bConfig {
             advices,
             s_field_decompose,
@@ -512,6 +540,7 @@ impl<F: PrimeField> Blake2bConfig<F> {
             s_result_encode,
             s_canonicality,
             s_high_bit_zero,
+            s_word_combine,
             _marker: PhantomData,
         }
     }
@@ -1000,21 +1029,18 @@ impl<F: PrimeField> Blake2bChip<F> {
         // We pass both the bits (for direct bit constraints) and words (for lower_128 computation).
         self.check_canonicality(layouter, &bits, &words_32)?;
 
-        // BLAKE2B-MOD: Create 64-bit Blake2bWords by combining pairs of 32-bit bit chunks
-        // We get 4 x 64-bit words from a 256-bit field element
+        // BLAKE2B-MOD: Create 64-bit Blake2bWords by combining pairs of 32-bit words.
+        // We get 4 x 64-bit words from a 256-bit field element.
+        // SOUNDNESS: Each 64-bit word is constrained via s_word_combine gate to equal
+        // the combination of two 32-bit words: word_64 = word_32_lo + word_32_hi * 2^32
         let mut res = Vec::with_capacity(4);
         for (i, chunk) in bits.chunks(64).enumerate() {
-            // Combine two adjacent 32-bit words into one 64-bit word
-            let word_64 = {
-                let w1 = words_32[i * 2].value();
-                let w2 = words_32[i * 2 + 1].value();
-                let word_value = w1.zip(w2).map(|(&lo, &hi)| lo + hi * F::from(1u64 << 32));
-                assign_free_advice(
-                    layouter.namespace(|| format!("64-bit word {}", i)),
-                    self.config.advices[8],
-                    word_value,
-                )?
-            };
+            // Combine two adjacent 32-bit words into one 64-bit word with constraint
+            let word_64 = self.word_combine(
+                layouter.namespace(|| format!("combine 32-bit words to 64-bit word {}", i)),
+                &words_32[i * 2],
+                &words_32[i * 2 + 1],
+            )?;
             res.push(Blake2bWord {
                 word: word_64,
                 bits: chunk.to_vec().try_into().unwrap(),
@@ -1235,6 +1261,54 @@ impl<F: PrimeField> Blake2bChip<F> {
                 }
                 word.copy_advice(|| "word", &mut region, self.config.advices[0], 1)?;
                 Ok(())
+            },
+        )
+    }
+
+    /// BLAKE2B-MOD: Combine two 32-bit words into one 64-bit word.
+    ///
+    /// This function constrains: word_64 = word_32_lo + word_32_hi * 2^32
+    ///
+    /// SOUNDNESS: This constraint is critical for ensuring that the 64-bit words
+    /// used in BLAKE2b operations are correctly derived from the 32-bit words
+    /// that were verified by the canonicality check.
+    fn word_combine(
+        &self,
+        mut layouter: impl Layouter<F>,
+        word_32_lo: &AssignedCell<F, F>,
+        word_32_hi: &AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        layouter.assign_region(
+            || "combine two 32-bit words to 64-bit",
+            |mut region| {
+                self.config.s_word_combine.enable(&mut region, 0)?;
+
+                // Copy the 32-bit words to row 0
+                word_32_lo.copy_advice(
+                    || "word_32_lo",
+                    &mut region,
+                    self.config.advices[0],
+                    0,
+                )?;
+                word_32_hi.copy_advice(
+                    || "word_32_hi",
+                    &mut region,
+                    self.config.advices[1],
+                    0,
+                )?;
+
+                // Compute and assign the 64-bit word to row 1
+                let word_64_value = word_32_lo
+                    .value()
+                    .zip(word_32_hi.value())
+                    .map(|(&lo, &hi)| lo + hi * F::from(1u64 << 32));
+
+                region.assign_advice(
+                    || "word_64",
+                    self.config.advices[0],
+                    1,
+                    || word_64_value,
+                )
             },
         )
     }

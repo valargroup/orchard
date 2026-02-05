@@ -643,6 +643,111 @@ impl<F: PrimeField> Blake2bChip<F> {
         Ok(h[0..4].to_vec())
     }
 
+    /// Process mixed field elements and raw bytes for compact action hash.
+    ///
+    /// This function implements a hybrid input system where:
+    /// - **field_inputs**: Data that IS field elements (nullifier, cmx) - canonicality checked
+    /// - **byte_inputs**: Arbitrary bytes (epk, enc[0..52]) - no canonicality check, just boolean constraints
+    ///
+    /// This distinction is critical for security:
+    /// - Nullifier and cmx are Pallas field elements, so they must be < p
+    /// - epk (curve point) and enc (ciphertext) can be arbitrary 32/52 bytes that may exceed p
+    ///
+    /// # Arguments
+    /// * `layouter` - The circuit layouter
+    /// * `field_inputs` - Field elements to hash (canonicality checked)
+    /// * `byte_inputs` - Raw bytes to hash (each cell = 1 byte, boolean constrained only)
+    /// * `personalization` - 16-byte personalization string
+    ///
+    /// # Returns
+    /// The BLAKE2b-256 hash result as 4 x 64-bit words.
+    pub fn process_hybrid(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        field_inputs: &[AssignedCell<F, F>],
+        byte_inputs: &[AssignedCell<F, F>],
+        personalization: &[u8; 16],
+    ) -> Result<Vec<Blake2bWord<F>>, Error> {
+        // Initialize BLAKE2b state with personalization
+        let mut h = vec![
+            Blake2bWord::from_constant_u64(IV[0] ^ 0x01010000 ^ 32, layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[1], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[2], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[3], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[4], layouter, self)?,
+            Blake2bWord::from_constant_u64(IV[5], layouter, self)?,
+            Blake2bWord::from_constant_u64(
+                IV[6] ^ LittleEndian::read_u64(&personalization[0..8]),
+                layouter,
+                self,
+            )?,
+            Blake2bWord::from_constant_u64(
+                IV[7] ^ LittleEndian::read_u64(&personalization[8..16]),
+                layouter,
+                self,
+            )?,
+        ];
+
+        // Convert field inputs to words (with canonicality check)
+        let mut all_words = Vec::new();
+        for (i, field) in field_inputs.iter().enumerate() {
+            let words = self.field_decompose(
+                &mut layouter.namespace(|| format!("field_decompose_{}", i)),
+                field,
+            )?;
+            all_words.extend(words);
+        }
+
+        // Convert byte inputs to words (no canonicality check, just boolean constraints)
+        let byte_words = self.bytes_to_words(
+            &mut layouter.namespace(|| "bytes_to_words"),
+            byte_inputs,
+        )?;
+        all_words.extend(byte_words);
+
+        // Calculate total input bytes for BLAKE2b counter
+        // Field inputs: 32 bytes each, Byte inputs: 1 byte each
+        let total_bytes = field_inputs.len() * 32 + byte_inputs.len();
+
+        // Pack words into 128-byte blocks (16 x 64-bit words per block)
+        let mut blocks = Vec::new();
+        for block_words in all_words.chunks(16) {
+            let mut cur_block = block_words.to_vec();
+            // Pad with zeros if we don't have 16 words
+            while cur_block.len() < 16 {
+                cur_block.push(Blake2bWord::from_constant_u64(0, layouter, self)?);
+            }
+            blocks.push(cur_block);
+        }
+
+        if blocks.is_empty() {
+            // Empty input - use zero padding block
+            let zero_block = (0..16)
+                .map(|_| Blake2bWord::from_constant_u64(0, layouter, self).unwrap())
+                .collect();
+            blocks.push(zero_block);
+        }
+
+        let block_len = blocks.len();
+
+        // Compress all blocks except the last one
+        for (i, block) in blocks[0..(block_len - 1)].iter().enumerate() {
+            self.compress(layouter, &mut h, block, (i as u128 + 1) * 128, false)?;
+        }
+
+        // Compress final block with total byte count
+        self.compress(
+            layouter,
+            &mut h,
+            &blocks[block_len - 1],
+            total_bytes.max(128) as u128,
+            true,
+        )?;
+
+        // Return first 4 words (256 bits) for BLAKE2b-256
+        Ok(h[0..4].to_vec())
+    }
+
     /// BLAKE2B-MOD: Encode the four 64-bit words to two field elements.
     /// Each field element holds 128 bits (2 x 64-bit words).
     pub fn encode_result(
@@ -1315,6 +1420,85 @@ impl<F: PrimeField> Blake2bChip<F> {
                 )
             },
         )
+    }
+
+    /// Decompose raw bytes to Blake2bWords without field interpretation.
+    ///
+    /// Unlike field_decompose(), this function does NOT perform canonicality checks
+    /// because the input bytes may represent arbitrary data (like curve points or
+    /// ciphertext) that can exceed the field modulus.
+    ///
+    /// Each byte is decomposed to 8 bits with boolean constraints, ensuring the
+    /// bytes are well-formed even without canonicality.
+    ///
+    /// # Arguments
+    /// * `layouter` - The circuit layouter
+    /// * `bytes` - The input bytes (each cell holds one byte value 0-255)
+    ///
+    /// # Returns
+    /// A vector of Blake2bWords constructed from the input bytes.
+    /// The bytes are packed into 64-bit words in little-endian order.
+    pub fn bytes_to_words(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        bytes: &[AssignedCell<F, F>],
+    ) -> Result<Vec<Blake2bWord<F>>, Error> {
+        let mut all_bits = Vec::with_capacity((bytes.len() + 7) / 8 * 64);
+
+        // Decompose each byte to 8 bits with boolean constraints
+        for (i, byte_cell) in bytes.iter().enumerate() {
+            // Get the byte value from the cell
+            let byte_value = byte_cell.value().map(|f| {
+                let repr = f.to_repr();
+                repr.as_ref()[0]
+            });
+
+            // Create bits for this byte
+            let mut byte_bits = Vec::with_capacity(8);
+            for j in 0..8 {
+                let bit_value = byte_value.map(|b| F::from(((b >> j) & 1) as u64));
+                let bit = assign_free_advice(
+                    layouter.namespace(|| format!("byte_{}_bit_{}", i, j)),
+                    self.config.advices[0],
+                    bit_value,
+                )?;
+                byte_bits.push(bit);
+            }
+
+            // Constrain: byte = sum of bits * 2^i, and each bit is boolean
+            // Uses the s_byte_decompose gate
+            self.byte_decompose(
+                layouter.namespace(|| format!("decompose_byte_{}", i)),
+                &byte_bits,
+                byte_cell,
+            )?;
+
+            all_bits.extend(byte_bits);
+        }
+
+        // Pad with zero bits to reach a multiple of 64
+        let padding_needed = (64 - (all_bits.len() % 64)) % 64;
+        for i in 0..padding_needed {
+            let zero_bit = assign_free_constant(
+                layouter.namespace(|| format!("zero_padding_bit_{}", i)),
+                self.config.advices[0],
+                F::ZERO,
+            )?;
+            all_bits.push(zero_bit);
+        }
+
+        // Convert bits to 64-bit words
+        let mut words = Vec::with_capacity(all_bits.len() / 64);
+        for (i, chunk) in all_bits.chunks(64).enumerate() {
+            let word = Blake2bWord::from_bits(
+                self,
+                layouter.namespace(|| format!("word_from_bytes_{}", i)),
+                chunk.to_vec(),
+            )?;
+            words.push(word);
+        }
+
+        Ok(words)
     }
 
     /// Decompose a byte to eight bits.

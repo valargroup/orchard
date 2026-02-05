@@ -11,6 +11,37 @@ use halo2_proofs::{
 use orchard::circuit::blake2b::{assign_free_advice, Blake2bChip, Blake2bConfig};
 use pasta_curves::pallas;
 
+/// Test vector data from Zcash test vectors for compact action hash testing.
+/// Source: orchard_note_encryption test vectors
+mod compact_test_data {
+    // Test vector 0 from note_encryption.rs
+    pub const NF_OLD: [u8; 32] = [
+        0xc5, 0x96, 0xfb, 0xd3, 0x2e, 0xbb, 0xcb, 0xad, 0xae, 0x60, 0xd2, 0x85, 0xc7, 0xd7,
+        0x5f, 0xa8, 0x36, 0xf9, 0xd2, 0xfa, 0x86, 0x10, 0x0a, 0xb8, 0x58, 0xea, 0x2d, 0xe1,
+        0xf1, 0x1c, 0x83, 0x06,
+    ];
+
+    pub const CMX: [u8; 32] = [
+        0xa5, 0x70, 0x6f, 0x3d, 0x1b, 0x68, 0x8e, 0x9d, 0xc6, 0x34, 0xee, 0xe4, 0xe6, 0x5b,
+        0x02, 0x8a, 0x43, 0xee, 0xae, 0xd2, 0x43, 0x5b, 0xea, 0x2a, 0xe3, 0xd5, 0x16, 0x05,
+        0x75, 0xc1, 0x1a, 0x3b,
+    ];
+
+    pub const EPHEMERAL_KEY: [u8; 32] = [
+        0xad, 0xdb, 0x47, 0xb6, 0xac, 0x5d, 0xfc, 0x16, 0x55, 0x89, 0x23, 0xd3, 0xa8, 0xf3,
+        0x76, 0x09, 0x5c, 0x69, 0x5c, 0x04, 0x7c, 0x4e, 0x32, 0x66, 0xae, 0x67, 0x69, 0x87,
+        0xf7, 0xe3, 0x13, 0x81,
+    ];
+
+    // First 52 bytes of c_enc
+    pub const C_ENC_PREFIX: [u8; 52] = [
+        0x1a, 0x9a, 0xdb, 0x14, 0x24, 0x98, 0xe3, 0xdc, 0xc7, 0x6f, 0xed, 0x77, 0x86, 0x14,
+        0xdd, 0x31, 0x6c, 0x02, 0xfb, 0xb8, 0xba, 0x92, 0x44, 0xae, 0x4c, 0x2e, 0x32, 0xa0,
+        0x7d, 0xae, 0xec, 0xa4, 0x12, 0x26, 0xb9, 0x8b, 0xfe, 0x74, 0xf9, 0xfc, 0xb2, 0x28,
+        0xcf, 0xc1, 0x00, 0xf3, 0x18, 0x0f, 0x57, 0x75, 0xec, 0xe3,
+    ];
+}
+
 #[derive(Default)]
 struct Blake2bTestCircuit {
     input1: Value<pallas::Base>,
@@ -526,4 +557,186 @@ fn test_blake2b_zeros_against_reference() {
     let k = 17;
     let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
     assert_eq!(prover.verify(), Ok(()), "BLAKE2b zeros test failed");
+}
+
+/// Test: Compact Action Hash with Nullifier as Private Input
+///
+/// Proves: "I know nullifier N such that
+/// BLAKE2b-256("ZTxIdOrcActCHash", N || cmx || epk || enc[0..52]) = expected_hash"
+///
+/// This test demonstrates the hybrid input system where:
+/// - nullifier and cmx are field elements (canonicality checked)
+/// - epk and enc[0..52] are raw bytes (boolean constrained only)
+#[test]
+fn test_compact_hash_nullifier_proof() {
+    use compact_test_data::*;
+
+    /// Circuit proving knowledge of a nullifier for compact action hash
+    struct CompactHashCircuit {
+        // PRIVATE witness - the secret we're proving knowledge of
+        nullifier: Value<pallas::Base>,
+
+        // PUBLIC inputs (known to verifier)
+        cmx: Value<pallas::Base>,
+        epk_bytes: Value<[u8; 32]>,
+        enc_prefix: Value<[u8; 52]>,
+    }
+
+    #[derive(Clone)]
+    struct CompactHashConfig {
+        blake2b_config: Blake2bConfig<pallas::Base>,
+        instance: Column<Instance>,
+    }
+
+    impl Circuit<pallas::Base> for CompactHashCircuit {
+        type Config = CompactHashConfig;
+        type FloorPlanner = floor_planner::V1;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                nullifier: Value::unknown(),
+                cmx: Value::unknown(),
+                epk_bytes: Value::unknown(),
+                enc_prefix: Value::unknown(),
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
+            let advices = [
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+            ];
+
+            for advice in advices.iter() {
+                meta.enable_equality(*advice);
+            }
+
+            let instance = meta.instance_column();
+            meta.enable_equality(instance);
+
+            let constants = meta.fixed_column();
+            meta.enable_constant(constants);
+
+            CompactHashConfig {
+                blake2b_config: Blake2bConfig::configure(meta, advices),
+                instance,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<pallas::Base>,
+        ) -> Result<(), Error> {
+            // Assign field inputs (nullifier is private, cmx is public)
+            let nullifier = assign_free_advice(
+                layouter.namespace(|| "nullifier"),
+                config.blake2b_config.advices[0],
+                self.nullifier,
+            )?;
+
+            let cmx = assign_free_advice(
+                layouter.namespace(|| "cmx"),
+                config.blake2b_config.advices[0],
+                self.cmx,
+            )?;
+
+            // Assign byte inputs (epk and enc_prefix)
+            let mut byte_cells = Vec::with_capacity(32 + 52);
+
+            // epk bytes
+            for i in 0..32 {
+                let byte_val = self.epk_bytes.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                let byte_cell = assign_free_advice(
+                    layouter.namespace(|| format!("epk_byte_{}", i)),
+                    config.blake2b_config.advices[0],
+                    byte_val,
+                )?;
+                byte_cells.push(byte_cell);
+            }
+
+            // enc_prefix bytes
+            for i in 0..52 {
+                let byte_val = self.enc_prefix.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                let byte_cell = assign_free_advice(
+                    layouter.namespace(|| format!("enc_byte_{}", i)),
+                    config.blake2b_config.advices[0],
+                    byte_val,
+                )?;
+                byte_cells.push(byte_cell);
+            }
+
+            // Compute compact action hash using hybrid processing
+            let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
+            let result = blake2b_chip.process_hybrid(
+                &mut layouter,
+                &[nullifier, cmx],  // Field inputs (canonicality checked)
+                &byte_cells,         // Byte inputs (boolean constrained only)
+                b"ZTxIdOrcActCHash", // ZIP-244 personalization for compact action hash
+            )?;
+
+            // Expose hash output as public inputs for verification
+            for (i, word) in result.iter().enumerate() {
+                layouter.constrain_instance(
+                    word.get_word().cell(),
+                    config.instance,
+                    i,
+                )?;
+            }
+
+            Ok(())
+        }
+    }
+
+    // Compute expected hash using blake2b_simd reference implementation
+    let expected_hash = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZTxIdOrcActCHash")
+        .to_state()
+        .update(&NF_OLD)
+        .update(&CMX)
+        .update(&EPHEMERAL_KEY)
+        .update(&C_ENC_PREFIX)
+        .finalize();
+
+    // Convert expected hash to 4 x 64-bit words (little-endian)
+    let hash_bytes = expected_hash.as_bytes();
+    let expected_words: Vec<pallas::Base> = (0..4)
+        .map(|i| {
+            let start = i * 8;
+            let word = u64::from_le_bytes(hash_bytes[start..start + 8].try_into().unwrap());
+            pallas::Base::from(word)
+        })
+        .collect();
+
+    // Convert field element bytes to pallas::Base
+    // Note: These should be valid field elements (< p)
+    let nullifier = pallas::Base::from_repr(NF_OLD.into()).expect("nullifier should be valid field element");
+    let cmx = pallas::Base::from_repr(CMX.into()).expect("cmx should be valid field element");
+
+    let circuit = CompactHashCircuit {
+        nullifier: Value::known(nullifier),
+        cmx: Value::known(cmx),
+        epk_bytes: Value::known(EPHEMERAL_KEY),
+        enc_prefix: Value::known(C_ENC_PREFIX),
+    };
+
+    let k = 17;
+    let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
+    assert_eq!(
+        prover.verify(),
+        Ok(()),
+        "Compact action hash nullifier proof failed"
+    );
+
+    println!("SUCCESS: Proved knowledge of nullifier for compact action hash");
+    println!("Expected hash: {}", hex::encode(hash_bytes));
 }

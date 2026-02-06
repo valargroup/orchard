@@ -1,54 +1,68 @@
 # Compact Action Hash Nullifier Proof — Circuit Flow
 
-Goal: Prove knowledge of a nullifier such that
-BLAKE2b-256("ZTxIdOrcActCHash", nf || cmx || epk || enc[0..52]) = action_hash
+## Goal
+
+Prove knowledge of a nullifier such that
+
+    BLAKE2b-256("ZTxIdOrcActCHash", nf || cmx || epk || enc[0..52]) = action_hash
+
 without revealing the nullifier.
 
-Terminology:
-- p (field modulus) — The Pallas base field prime,
-                      0x40000000...00000001 (~2^254). All field
-                      arithmetic is mod p.
-- canonicality      — A field element x has two 256-bit representations:
-                      x and x+p (since x ≡ x+p mod p). Both decompose
-                      to different bytes, producing different BLAKE2b
-                      hashes. The canonicality check forces x < p,
-                      ensuring a unique byte representation. Required
-                      for nf and cmx (which are field elements) but NOT
-                      for epk or enc — those are raw bytes, not field
-                      elements. Their byte values *are* the data; there
-                      is no mod-p equivalence to resolve. A 32-byte epk
-                      whose integer value exceeds p is valid data, not
-                      an alternative representation of something smaller.
-- IV (initialization vector) — 8 fixed 64-bit constants defined by BLAKE2b
-                      (RFC 7693 §2.6), derived from the fractional parts of
-                      sqrt(2..9). The State Init step XORs some IV words with
-                      the parameter block (digest length, personalization) to
-                      produce the starting hash state h.
 
-ZIP-244 compact action hash inputs:
+## Terminology
 
-  Pallas field elements (canonicality checked, must be < p):
-  - nf (nullifier)       — A unique tag derived from a note's secret key and
-                           position. Publicly revealing it marks a note as spent.
-                           This is the value we keep private in the proof.
-  - cmx (note commitment) — A Pedersen-like commitment to the note's contents
-                           (recipient, value, etc.). Binds the action to a
-                           specific output note without revealing its details.
+**p** (field modulus)
+  The Pallas base field prime, ~2^254. All field arithmetic is mod p.
 
-  Arbitrary bytes (boolean-constrained only, may exceed p):
-  - epk (ephemeral public key) — A one-time Diffie-Hellman key used by the
-                           recipient to decrypt the note. Serialized as 32
-                           bytes (curve point).
-  - enc[0..52]           — The first 52 bytes of the encrypted note ciphertext.
-                           Contains the encrypted plaintext header (diversifier,
-                           value, rseed).
+**canonicality**
+  A field element x has two 256-bit representations: x and x+p
+  (since x ≡ x+p mod p). Both decompose to different bytes, producing
+  different BLAKE2b hashes. The canonicality check forces x < p,
+  ensuring a unique byte representation. Required for nf and cmx
+  (which are field elements) but NOT for epk or enc — those are raw
+  bytes, not field elements. Their byte values *are* the data; there
+  is no mod-p equivalence to resolve.
 
-  Other:
-  - action_hash          — The expected BLAKE2b-256 output. The verifier
-                           provides this publicly; the circuit proves the
-                           inputs hash to it.
-  - "ZTxIdOrcActCHash"   — The 16-byte BLAKE2b personalization string defined
-                           by ZIP-244 for the compact action hash digest.
+**IV** (initialization vector)
+  8 fixed 64-bit constants defined by BLAKE2b (RFC 7693), derived from
+  the fractional parts of sqrt(2..9). The State Init step XORs some IV
+  words with the parameter block (digest length, personalization) to
+  produce the starting hash state h.
+
+
+## ZIP-244 Compact Action Hash Inputs
+
+### Pallas field elements (canonicality checked, must be < p)
+
+**nf** (nullifier) — 32 bytes
+  A unique tag derived from a note's secret key and position.
+  Publicly revealing it marks a note as spent.
+  This is the value we keep private in the proof.
+
+**cmx** (note commitment) — 32 bytes
+  A Pedersen-like commitment to the note's contents (recipient,
+  value, etc.). Binds the action to a specific output note without
+  revealing its details.
+
+### Arbitrary bytes (boolean-constrained only, may exceed p)
+
+**epk** (ephemeral public key) — 32 bytes
+  A one-time Diffie-Hellman key used by the recipient to decrypt
+  the note. Serialized as a curve point.
+
+**enc[0..52]** — 52 bytes
+  The first 52 bytes of the encrypted note ciphertext. Contains
+  the encrypted plaintext header (diversifier, value, rseed).
+
+### Other
+
+**action_hash** — 256 bits
+  The expected BLAKE2b-256 output. The verifier provides this
+  publicly; the circuit proves the inputs hash to it.
+
+**"ZTxIdOrcActCHash"** — 16 bytes
+  The BLAKE2b personalization string defined by ZIP-244 for the
+  compact action hash digest.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗

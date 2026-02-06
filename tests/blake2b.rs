@@ -16,29 +16,29 @@ use pasta_curves::pallas;
 mod compact_test_data {
     // Test vector 0 from note_encryption.rs
     pub const NF_OLD: [u8; 32] = [
-        0xc5, 0x96, 0xfb, 0xd3, 0x2e, 0xbb, 0xcb, 0xad, 0xae, 0x60, 0xd2, 0x85, 0xc7, 0xd7,
-        0x5f, 0xa8, 0x36, 0xf9, 0xd2, 0xfa, 0x86, 0x10, 0x0a, 0xb8, 0x58, 0xea, 0x2d, 0xe1,
-        0xf1, 0x1c, 0x83, 0x06,
+        0xc5, 0x96, 0xfb, 0xd3, 0x2e, 0xbb, 0xcb, 0xad, 0xae, 0x60, 0xd2, 0x85, 0xc7, 0xd7, 0x5f,
+        0xa8, 0x36, 0xf9, 0xd2, 0xfa, 0x86, 0x10, 0x0a, 0xb8, 0x58, 0xea, 0x2d, 0xe1, 0xf1, 0x1c,
+        0x83, 0x06,
     ];
 
     pub const CMX: [u8; 32] = [
-        0xa5, 0x70, 0x6f, 0x3d, 0x1b, 0x68, 0x8e, 0x9d, 0xc6, 0x34, 0xee, 0xe4, 0xe6, 0x5b,
-        0x02, 0x8a, 0x43, 0xee, 0xae, 0xd2, 0x43, 0x5b, 0xea, 0x2a, 0xe3, 0xd5, 0x16, 0x05,
-        0x75, 0xc1, 0x1a, 0x3b,
+        0xa5, 0x70, 0x6f, 0x3d, 0x1b, 0x68, 0x8e, 0x9d, 0xc6, 0x34, 0xee, 0xe4, 0xe6, 0x5b, 0x02,
+        0x8a, 0x43, 0xee, 0xae, 0xd2, 0x43, 0x5b, 0xea, 0x2a, 0xe3, 0xd5, 0x16, 0x05, 0x75, 0xc1,
+        0x1a, 0x3b,
     ];
 
     pub const EPHEMERAL_KEY: [u8; 32] = [
-        0xad, 0xdb, 0x47, 0xb6, 0xac, 0x5d, 0xfc, 0x16, 0x55, 0x89, 0x23, 0xd3, 0xa8, 0xf3,
-        0x76, 0x09, 0x5c, 0x69, 0x5c, 0x04, 0x7c, 0x4e, 0x32, 0x66, 0xae, 0x67, 0x69, 0x87,
-        0xf7, 0xe3, 0x13, 0x81,
+        0xad, 0xdb, 0x47, 0xb6, 0xac, 0x5d, 0xfc, 0x16, 0x55, 0x89, 0x23, 0xd3, 0xa8, 0xf3, 0x76,
+        0x09, 0x5c, 0x69, 0x5c, 0x04, 0x7c, 0x4e, 0x32, 0x66, 0xae, 0x67, 0x69, 0x87, 0xf7, 0xe3,
+        0x13, 0x81,
     ];
 
     // First 52 bytes of c_enc
     pub const C_ENC_PREFIX: [u8; 52] = [
-        0x1a, 0x9a, 0xdb, 0x14, 0x24, 0x98, 0xe3, 0xdc, 0xc7, 0x6f, 0xed, 0x77, 0x86, 0x14,
-        0xdd, 0x31, 0x6c, 0x02, 0xfb, 0xb8, 0xba, 0x92, 0x44, 0xae, 0x4c, 0x2e, 0x32, 0xa0,
-        0x7d, 0xae, 0xec, 0xa4, 0x12, 0x26, 0xb9, 0x8b, 0xfe, 0x74, 0xf9, 0xfc, 0xb2, 0x28,
-        0xcf, 0xc1, 0x00, 0xf3, 0x18, 0x0f, 0x57, 0x75, 0xec, 0xe3,
+        0x1a, 0x9a, 0xdb, 0x14, 0x24, 0x98, 0xe3, 0xdc, 0xc7, 0x6f, 0xed, 0x77, 0x86, 0x14, 0xdd,
+        0x31, 0x6c, 0x02, 0xfb, 0xb8, 0xba, 0x92, 0x44, 0xae, 0x4c, 0x2e, 0x32, 0xa0, 0x7d, 0xae,
+        0xec, 0xa4, 0x12, 0x26, 0xb9, 0x8b, 0xfe, 0x74, 0xf9, 0xfc, 0xb2, 0x28, 0xcf, 0xc1, 0x00,
+        0xf3, 0x18, 0x0f, 0x57, 0x75, 0xec, 0xe3,
     ];
 }
 
@@ -97,12 +97,8 @@ impl Circuit<pallas::Base> for Blake2bTestCircuit {
         )?;
 
         let blake2b_chip = Blake2bChip::construct(config);
-        // BLAKE2B-MOD: 16-byte personalization (was 8 bytes in BLAKE2s)
-        let _result = blake2b_chip.process(
-            &mut layouter,
-            &[input1, input2],
-            b"ZcshBlake2bTest!", // 16-byte personalization
-        )?;
+        let _result =
+            blake2b_chip.process(&mut layouter, &[input1, input2], b"ZcshBlake2bTest!")?;
 
         Ok(())
     }
@@ -115,7 +111,7 @@ fn test_blake2b_circuit() {
         input2: Value::known(pallas::Base::from(2u64)),
     };
 
-    let k = 17;  // BLAKE2B-MOD: May need larger circuit due to 64-bit operations
+    let k = 17;
     let prover = MockProver::run(k, &circuit, vec![]).unwrap();
     assert_eq!(prover.verify(), Ok(()));
 }
@@ -163,8 +159,6 @@ fn test_blake2b_empty_input() {
             mut layouter: impl Layouter<pallas::Base>,
         ) -> Result<(), Error> {
             let blake2b_chip = Blake2bChip::construct(config);
-            // BLAKE2B-MOD: 16-byte personalization (was 8 bytes in BLAKE2s)
-            // Empty input - will use zero padding block
             let _result = blake2b_chip.process(&mut layouter, &[], b"EmptyTestBlake2b")?;
 
             Ok(())
@@ -181,7 +175,6 @@ fn test_blake2b_empty_input() {
 mod reference {
     use byteorder::{ByteOrder, LittleEndian};
 
-    // BLAKE2B-MOD: 64-bit IV constants
     const IV: [u64; 8] = [
         0x6a09e667f3bcc908,
         0xbb67ae8584caa73b,
@@ -206,29 +199,26 @@ mod reference {
         [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
     ];
 
-    // BLAKE2B-MOD: 64-bit G function with different rotations (32, 24, 16, 63)
     fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
         v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
-        v[d] = (v[d] ^ v[a]).rotate_right(32);  // R1 = 32
+        v[d] = (v[d] ^ v[a]).rotate_right(32);
         v[c] = v[c].wrapping_add(v[d]);
-        v[b] = (v[b] ^ v[c]).rotate_right(24);  // R2 = 24
+        v[b] = (v[b] ^ v[c]).rotate_right(24);
         v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
-        v[d] = (v[d] ^ v[a]).rotate_right(16);  // R3 = 16
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
         v[c] = v[c].wrapping_add(v[d]);
-        v[b] = (v[b] ^ v[c]).rotate_right(63);  // R4 = 63
+        v[b] = (v[b] ^ v[c]).rotate_right(63);
     }
 
-    // BLAKE2B-MOD: 12 rounds (was 10 in BLAKE2s)
     fn compress(h: &mut [u64; 8], m: &[u64; 16], t: u128, f: bool) {
         let mut v = [0u64; 16];
         v[..8].copy_from_slice(h);
         v[8..12].copy_from_slice(&IV[0..4]);
-        v[12] = IV[4] ^ (t as u64);       // Low 64 bits of counter
-        v[13] = IV[5] ^ ((t >> 64) as u64);  // High 64 bits of counter
+        v[12] = IV[4] ^ (t as u64); // Low 64 bits of counter
+        v[13] = IV[5] ^ ((t >> 64) as u64); // High 64 bits of counter
         v[14] = if f { IV[6] ^ u64::MAX } else { IV[6] };
         v[15] = IV[7];
 
-        // BLAKE2B-MOD: 12 rounds (was 10 in BLAKE2s)
         for i in 0..12 {
             let s = &SIGMA[i % 10];
             g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
@@ -253,11 +243,7 @@ mod reference {
     /// elements (4 * 32 = 128 bytes) per block. Each field element provides 4 x 64-bit
     /// words, so one block = 4 fields = 16 x 64-bit words = 128 bytes.
     ///
-    /// BLAKE2B-MOD: Returns 4 words (256 bits) for BLAKE2b-256, matching Orchard's
-    /// action hash requirements (ZIP-244).
     pub fn blake2b_hash(inputs: &[&[u8; 32]], personalization: &[u8; 16]) -> [u64; 4] {
-        // Initialize state with personalization
-        // BLAKE2B-MOD: 32-byte output length (BLAKE2b-256)
         let mut h = [
             IV[0] ^ 0x01010000 ^ 32,
             IV[1],
@@ -315,7 +301,6 @@ mod reference {
             compress(&mut h, &m, t, is_last);
         }
 
-        // BLAKE2B-MOD: Return first 4 words (256 bits) for BLAKE2b-256
         [h[0], h[1], h[2], h[3]]
     }
 }
@@ -396,19 +381,12 @@ fn test_blake2b_against_reference() {
             )?;
 
             let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
-            let result = blake2b_chip.process(
-                &mut layouter,
-                &[input1, input2],
-                &self.personalization,
-            )?;
+            let result =
+                blake2b_chip.process(&mut layouter, &[input1, input2], &self.personalization)?;
 
-            // BLAKE2B-MOD: Expose all 4 words (256 bits) as public inputs
+            // Expose hash output words as public inputs
             for (i, word) in result.iter().enumerate() {
-                layouter.constrain_instance(
-                    word.get_word().cell(),
-                    config.instance,
-                    i,
-                )?;
+                layouter.constrain_instance(word.get_word().cell(), config.instance, i)?;
             }
 
             Ok(())
@@ -418,7 +396,7 @@ fn test_blake2b_against_reference() {
     // Test inputs
     let input1 = pallas::Base::from(0x12345678_9abcdef0_u64);
     let input2 = pallas::Base::from(0xfedcba98_76543210_u64);
-    let personalization = *b"TestPersonaliz16";  // 16 bytes
+    let personalization = *b"TestPersonaliz16"; // 16 bytes
 
     // Get input bytes in the same format as the circuit
     let input1_bytes: [u8; 32] = input1.to_repr().as_ref().try_into().unwrap();
@@ -440,7 +418,11 @@ fn test_blake2b_against_reference() {
 
     let k = 17;
     let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
-    assert_eq!(prover.verify(), Ok(()), "Circuit output doesn't match reference BLAKE2b");
+    assert_eq!(
+        prover.verify(),
+        Ok(()),
+        "Circuit output doesn't match reference BLAKE2b"
+    );
 }
 
 /// Test with zero inputs
@@ -518,19 +500,11 @@ fn test_blake2b_zeros_against_reference() {
 
             let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
             // 16-byte zero personalization
-            let result = blake2b_chip.process(
-                &mut layouter,
-                &[input1, input2],
-                &[0u8; 16],
-            )?;
+            let result = blake2b_chip.process(&mut layouter, &[input1, input2], &[0u8; 16])?;
 
-            // BLAKE2B-MOD: Expose all 4 words (256 bits) as public inputs
+            // Expose hash output words as public inputs
             for (i, word) in result.iter().enumerate() {
-                layouter.constrain_instance(
-                    word.get_word().cell(),
-                    config.instance,
-                    i,
-                )?;
+                layouter.constrain_instance(word.get_word().cell(), config.instance, i)?;
             }
 
             Ok(())
@@ -654,7 +628,9 @@ fn test_compact_hash_nullifier_proof() {
 
             // epk bytes
             for i in 0..32 {
-                let byte_val = self.epk_bytes.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                let byte_val = self
+                    .epk_bytes
+                    .map(|bytes| pallas::Base::from(bytes[i] as u64));
                 let byte_cell = assign_free_advice(
                     layouter.namespace(|| format!("epk_byte_{}", i)),
                     config.blake2b_config.advices[0],
@@ -665,7 +641,9 @@ fn test_compact_hash_nullifier_proof() {
 
             // enc_prefix bytes
             for i in 0..52 {
-                let byte_val = self.enc_prefix.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                let byte_val = self
+                    .enc_prefix
+                    .map(|bytes| pallas::Base::from(bytes[i] as u64));
                 let byte_cell = assign_free_advice(
                     layouter.namespace(|| format!("enc_byte_{}", i)),
                     config.blake2b_config.advices[0],
@@ -678,18 +656,14 @@ fn test_compact_hash_nullifier_proof() {
             let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
             let result = blake2b_chip.process_hybrid(
                 &mut layouter,
-                &[nullifier, cmx],  // Field inputs (canonicality checked)
+                &[nullifier, cmx],   // Field inputs (canonicality checked)
                 &byte_cells,         // Byte inputs (boolean constrained only)
                 b"ZTxIdOrcActCHash", // ZIP-244 personalization for compact action hash
             )?;
 
             // Expose hash output as public inputs for verification
             for (i, word) in result.iter().enumerate() {
-                layouter.constrain_instance(
-                    word.get_word().cell(),
-                    config.instance,
-                    i,
-                )?;
+                layouter.constrain_instance(word.get_word().cell(), config.instance, i)?;
             }
 
             Ok(())
@@ -719,7 +693,8 @@ fn test_compact_hash_nullifier_proof() {
 
     // Convert field element bytes to pallas::Base
     // Note: These should be valid field elements (< p)
-    let nullifier = pallas::Base::from_repr(NF_OLD.into()).expect("nullifier should be valid field element");
+    let nullifier =
+        pallas::Base::from_repr(NF_OLD.into()).expect("nullifier should be valid field element");
     let cmx = pallas::Base::from_repr(CMX.into()).expect("cmx should be valid field element");
 
     let circuit = CompactHashCircuit {

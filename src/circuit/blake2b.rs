@@ -56,19 +56,26 @@ const A9: usize = 9;
 // ----------------
 
 /// Extract the least-significant byte from a field element's little-endian representation.
+///
+/// Used to recover a byte value from a field element known to be in [0, 255].
 fn f_to_u8_le<F: PrimeField>(f: &F) -> u8 {
     let repr = f.to_repr();
     repr.as_ref()[0]
 }
 
 /// Extract the least-significant 32 bits from a field element's little-endian representation.
+///
+/// Used to recover a 32-bit word from a field element known to be in [0, 2^32).
 fn f_to_u32_le<F: PrimeField>(f: &F) -> u32 {
     let repr = f.to_repr();
     let bytes = repr.as_ref();
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-/// Reconstruct a byte `Value` from assigned bit cells (MSB-first fold).
+/// Reconstruct a byte `Value` from assigned bit cells (little-endian).
+///
+/// Bits are stored least-significant-first. Reconstruction uses Horner's method
+/// on the reversed array: `fold(0, |acc, bit| acc * 2 + bit)`.
 fn byte_value_from_bits<F: PrimeField>(bits: &[AssignedCell<F, F>]) -> Value<F> {
     let bit_values: Value<Vec<_>> = bits.iter().map(|bit| bit.value()).collect();
     bit_values.map(|bits| {
@@ -78,7 +85,10 @@ fn byte_value_from_bits<F: PrimeField>(bits: &[AssignedCell<F, F>]) -> Value<F> 
     })
 }
 
-/// Reconstruct a word `Value` from assigned byte cells (MSB-first fold).
+/// Reconstruct a word `Value` from assigned byte cells (little-endian).
+///
+/// Bytes are stored least-significant-first. Reconstruction uses Horner's method
+/// on the reversed array: `fold(0, |acc, byte| acc * 256 + byte)`.
 fn word_value_from_bytes<F: PrimeField>(bytes: &[AssignedCell<F, F>]) -> Value<F> {
     let byte_values: Value<Vec<_>> = bytes.iter().map(|byte| byte.value()).collect();
     byte_values.map(|bytes| {
@@ -89,7 +99,10 @@ fn word_value_from_bytes<F: PrimeField>(bytes: &[AssignedCell<F, F>]) -> Value<F
     })
 }
 
-/// Reconstruct a field `Value` from 64-bit `Blake2bWord`s (MSB-first fold).
+/// Reconstruct a field `Value` from 64-bit `Blake2bWord`s (little-endian).
+///
+/// Words are stored least-significant-first. Reconstruction uses Horner's method
+/// on the reversed array: `fold(0, |acc, word| acc * 2^64 + word)`.
 fn field_value_from_words_64<F: PrimeField>(words: &[Blake2bWord<F>]) -> Value<F> {
     let word_values: Value<Vec<_>> = words.iter().map(|word| word.get_word().value()).collect();
     word_values.map(|words| {
@@ -104,7 +117,10 @@ fn field_value_from_words_64<F: PrimeField>(words: &[Blake2bWord<F>]) -> Value<F
 // Helper gadgets
 // ----------------
 
-/// Witnesses the given value in a standalone region.
+/// Place a prover-supplied (witness) value into an advice cell.
+///
+/// "Free" means no selector is enabled in this region — the cell is unconstrained
+/// here and must be constrained elsewhere (typically via `copy_advice`).
 pub fn assign_free_advice<F: PrimeField>(
     mut layouter: impl Layouter<F>,
     column: Column<Advice>,
@@ -116,7 +132,10 @@ pub fn assign_free_advice<F: PrimeField>(
     )
 }
 
-/// Assigns a constant value in a standalone region.
+/// Place a public constant into an advice cell, pinned to the fixed column.
+///
+/// Unlike `assign_free_advice`, the verifier enforces the exact value.
+/// Used for spec-defined constants (IV words, zero padding, etc.).
 pub fn assign_free_constant<F: PrimeField>(
     mut layouter: impl Layouter<F>,
     column: Column<Advice>,
@@ -174,9 +193,13 @@ const R4: usize = 63;
 // Number of rounds in the compression function.
 const ROUNDS: usize = 12;
 
-// ---------------
+// ---- Chip, config, and type definitions ----
 
-/// BLAKE2b chip for halo2.
+/// Constrained BLAKE2b-256 chip for Orchard compact action hashes (ZIP-244).
+///
+/// Delegates gate definitions to [`Blake2bConfig`] and provides synthesis methods
+/// for hashing field elements and raw bytes through the BLAKE2b-256 compression
+/// function.
 #[derive(Clone, Debug)]
 pub struct Blake2bChip<F: PrimeField> {
     config: Blake2bConfig<F>,
@@ -184,6 +207,10 @@ pub struct Blake2bChip<F: PrimeField> {
 }
 
 /// Configuration for the BLAKE2b chip.
+///
+/// Defines 9 custom gates (field/word/byte decomposition, XOR, addition, result
+/// encoding, canonicality, high-bit-zero, word-combine). The [`configure`](Self::configure)
+/// method contains all constraint definitions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Blake2bConfig<F: PrimeField> {
     /// Advice columns used by the chip.
@@ -210,104 +237,27 @@ pub struct Blake2bConfig<F: PrimeField> {
 }
 
 /// A 64-bit word represented as both a packed field element and its 64 individual bit cells.
+///
+/// The dual representation exists because addition gates operate on packed words while
+/// XOR and rotation gates operate on individual bits. Both views must stay in sync via
+/// decomposition constraints.
 #[derive(Clone, Debug)]
 pub struct Blake2bWord<F: PrimeField> {
     word: AssignedCell<F, F>,
     bits: [AssignedCell<F, F>; 64],
 }
 
-/// One byte has 8 bits.
+/// Intermediate decomposition unit: words are decomposed to bytes, bytes to bits.
+///
+/// Each bit is boolean-constrained, which transitively range-checks the byte to
+/// \[0, 255\] and the word to its target range.
 #[derive(Clone, Debug)]
 struct Blake2bByte<F: PrimeField> {
     byte: AssignedCell<F, F>,
     bits: [AssignedCell<F, F>; 8],
 }
 
-impl<F: PrimeField> Blake2bByte<F> {
-    pub fn get_byte(&self) -> AssignedCell<F, F> {
-        self.byte.clone()
-    }
-
-    pub fn get_bits(&self) -> &[AssignedCell<F, F>; 8] {
-        &self.bits
-    }
-
-    /// Decompose a private witness byte into 8 boolean-constrained bits.
-    ///
-    /// The prover supplies the byte value; the `s_byte_decompose` gate enforces
-    /// that the bits are binary and reconstruct the byte.
-    pub fn from_u8(
-        value: Value<u8>,
-        mut layouter: impl Layouter<F>,
-        config: &Blake2bConfig<F>,
-    ) -> Result<Self, Error> {
-        layouter.assign_region(
-            || "decompose bytes to bits",
-            |mut region| {
-                config.s_byte_decompose.enable(&mut region, 0)?;
-                let mut byte = value;
-                let mut bits = Vec::with_capacity(8);
-                for i in 0..8 {
-                    let bit = byte.map(|b| F::from((b & 1) as u64));
-                    let bit_var = region.assign_advice(|| "bit", config.advices[i], 0, || bit)?;
-                    bits.push(bit_var);
-                    byte = byte.map(|b| b >> 1);
-                }
-                let byte = region.assign_advice(
-                    || "byte",
-                    config.advices[A0],
-                    1,
-                    || value.map(|v| F::from(v as u64)),
-                )?;
-                Ok(Self {
-                    byte,
-                    bits: bits.try_into().unwrap(),
-                })
-            },
-        )
-    }
-
-    /// Decompose a public constant byte into 8 boolean-constrained bits.
-    ///
-    /// Unlike `from_u8`, each cell is pinned to the fixed column via
-    /// `assign_advice_from_constant`, so the verifier enforces exact values.
-    /// Used for spec-defined constants like IV words and zero padding.
-    pub fn from_constant_u8(
-        value: u8,
-        layouter: &mut impl Layouter<F>,
-        config: &Blake2bConfig<F>,
-    ) -> Result<Self, Error> {
-        layouter.assign_region(
-            || "decompose bytes to bits",
-            |mut region| {
-                config.s_byte_decompose.enable(&mut region, 0)?;
-                let mut byte = value;
-                let mut bits = Vec::with_capacity(8);
-                for i in 0..8 {
-                    let bit = byte & 1;
-                    let bit_var = region.assign_advice_from_constant(
-                        || "bit",
-                        config.advices[i],
-                        0,
-                        F::from(bit as u64),
-                    )?;
-                    bits.push(bit_var);
-                    byte >>= 1;
-                }
-                let byte = region.assign_advice_from_constant(
-                    || "byte",
-                    config.advices[A0],
-                    1,
-                    F::from(value as u64),
-                )?;
-                Ok(Self {
-                    byte,
-                    bits: bits.try_into().unwrap(),
-                })
-            },
-        )
-    }
-}
+// ---- Gate definitions ----
 
 impl<F: PrimeField> Blake2bConfig<F> {
     /// Configure the BLAKE2b chip.
@@ -437,6 +387,7 @@ impl<F: PrimeField> Blake2bConfig<F> {
                 let lhs_bit = meta.query_advice(advices[idx], Rotation::prev());
                 let rhs_bit = meta.query_advice(advices[idx], Rotation::cur());
                 let out_bit = meta.query_advice(advices[idx], Rotation::next());
+                // Arithmetic XOR: a + b - 2ab = a XOR b when a,b ∈ {0,1}
                 lhs_bit.clone() + rhs_bit.clone() - lhs_bit * rhs_bit * F::from(2) - out_bit
             };
 
@@ -628,6 +579,208 @@ impl<F: PrimeField> Blake2bConfig<F> {
     }
 }
 
+impl<F: PrimeField> Blake2bByte<F> {
+    pub fn get_byte(&self) -> AssignedCell<F, F> {
+        self.byte.clone()
+    }
+
+    pub fn get_bits(&self) -> &[AssignedCell<F, F>; 8] {
+        &self.bits
+    }
+
+    /// Decompose a private witness byte into 8 boolean-constrained bits.
+    ///
+    /// The prover supplies the byte value; the `s_byte_decompose` gate enforces
+    /// that the bits are binary and reconstruct the byte.
+    pub fn from_u8(
+        value: Value<u8>,
+        mut layouter: impl Layouter<F>,
+        config: &Blake2bConfig<F>,
+    ) -> Result<Self, Error> {
+        layouter.assign_region(
+            || "decompose bytes to bits",
+            |mut region| {
+                config.s_byte_decompose.enable(&mut region, 0)?;
+                let mut byte = value;
+                let mut bits = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let bit = byte.map(|b| F::from((b & 1) as u64));
+                    let bit_var = region.assign_advice(|| "bit", config.advices[i], 0, || bit)?;
+                    bits.push(bit_var);
+                    byte = byte.map(|b| b >> 1);
+                }
+                let byte = region.assign_advice(
+                    || "byte",
+                    config.advices[A0],
+                    1,
+                    || value.map(|v| F::from(v as u64)),
+                )?;
+                Ok(Self {
+                    byte,
+                    bits: bits.try_into().unwrap(),
+                })
+            },
+        )
+    }
+
+    /// Decompose a public constant byte into 8 boolean-constrained bits.
+    ///
+    /// Unlike `from_u8`, each cell is pinned to the fixed column via
+    /// `assign_advice_from_constant`, so the verifier enforces exact values.
+    /// Used for spec-defined constants like IV words and zero padding.
+    pub fn from_constant_u8(
+        value: u8,
+        layouter: &mut impl Layouter<F>,
+        config: &Blake2bConfig<F>,
+    ) -> Result<Self, Error> {
+        layouter.assign_region(
+            || "decompose bytes to bits",
+            |mut region| {
+                config.s_byte_decompose.enable(&mut region, 0)?;
+                let mut byte = value;
+                let mut bits = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let bit = byte & 1;
+                    let bit_var = region.assign_advice_from_constant(
+                        || "bit",
+                        config.advices[i],
+                        0,
+                        F::from(bit as u64),
+                    )?;
+                    bits.push(bit_var);
+                    byte >>= 1;
+                }
+                let byte = region.assign_advice_from_constant(
+                    || "byte",
+                    config.advices[A0],
+                    1,
+                    F::from(value as u64),
+                )?;
+                Ok(Self {
+                    byte,
+                    bits: bits.try_into().unwrap(),
+                })
+            },
+        )
+    }
+}
+
+// ---- Blake2bWord constructors and utilities ----
+
+impl<F: PrimeField> Blake2bWord<F> {
+    /// Create a `Blake2bWord` from a constant u64 value.
+    pub fn from_constant_u64(
+        value: u64,
+        layouter: &mut impl Layouter<F>,
+        chip: &Blake2bChip<F>,
+    ) -> Result<Self, Error> {
+        let mut bytes = Vec::with_capacity(8);
+        let mut word_bits = Vec::with_capacity(64);
+        let mut tmp = value;
+        for _ in 0..8 {
+            let input_byte = tmp as u8;
+            let byte = Blake2bByte::from_constant_u8(input_byte, layouter, &chip.config)?;
+            bytes.push(byte.get_byte());
+            word_bits.append(&mut byte.get_bits().to_vec());
+            tmp >>= 8;
+        }
+        let word = assign_free_constant(
+            layouter.namespace(|| "constant word"),
+            chip.config.advices[A0],
+            F::from(value),
+        )?;
+        chip.word_decompose(layouter.namespace(|| "word decompose"), &bytes, &word)?;
+        Ok(Self {
+            word,
+            bits: word_bits.try_into().unwrap(),
+        })
+    }
+
+    /// Rotate 64 bits right by the given number of positions.
+    pub fn word_rotate(bits: &[AssignedCell<F, F>], by: usize) -> Vec<AssignedCell<F, F>> {
+        assert!(bits.len() == 64);
+        let by = by % 64;
+        bits.iter()
+            .skip(by)
+            .chain(bits.iter())
+            .take(64)
+            .cloned()
+            .collect()
+    }
+
+    /// Shift 64 bits right by the given number of positions, filling with zeros.
+    pub fn shift(
+        &self,
+        by: usize,
+        mut layouter: impl Layouter<F>,
+        advice: Column<Advice>,
+    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
+        let by = by % 64;
+        let padding_zero = assign_free_constant(layouter.namespace(|| "zero"), advice, F::from(0))?;
+        let old_bits = self.get_bits();
+        Ok(old_bits
+            .iter()
+            .skip(by)
+            .chain(Some(&padding_zero).into_iter().cycle())
+            .take(64)
+            .cloned()
+            .collect())
+    }
+
+    /// Get the 64 bit cells.
+    pub fn get_bits(&self) -> &[AssignedCell<F, F>; 64] {
+        &self.bits
+    }
+
+    /// Get the word value.
+    pub fn get_word(&self) -> &AssignedCell<F, F> {
+        &self.word
+    }
+
+    /// Construct from 64 assigned bit cells.
+    pub fn from_bits(
+        chip: &Blake2bChip<F>,
+        mut layouter: impl Layouter<F>,
+        bits: Vec<AssignedCell<F, F>>,
+    ) -> Result<Self, Error> {
+        assert!(bits.len() == 64);
+        let mut bytes = Vec::with_capacity(8);
+        for bits in bits.chunks(8) {
+            let byte = chip.assign_byte_from_bits(layouter.namespace(|| "byte from bits"), bits)?;
+            bytes.push(byte);
+        }
+        let word =
+            chip.assign_word_64_from_bytes(layouter.namespace(|| "word from bytes"), &bytes)?;
+        Ok(Self {
+            word,
+            bits: bits.try_into().unwrap(),
+        })
+    }
+
+    /// Construct from an assigned 64-bit word cell by decomposing it into bytes and bits.
+    pub fn from_word(
+        chip: &Blake2bChip<F>,
+        mut layouter: impl Layouter<F>,
+        word: AssignedCell<F, F>,
+    ) -> Result<Self, Error> {
+        let mut bytes = Vec::with_capacity(8);
+        let mut bits = Vec::with_capacity(64);
+        for i in 0..8 {
+            let byte_value = word.value().map(|v| v.to_repr().as_ref()[i]);
+            let byte =
+                Blake2bByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &chip.config)?;
+            bits.append(&mut byte.get_bits().to_vec());
+            bytes.push(byte.get_byte());
+        }
+
+        chip.word_decompose(layouter.namespace(|| "word decompose"), &bytes, &word)?;
+        Ok(Self {
+            word,
+            bits: bits.try_into().unwrap(),
+        })
+    }
+}
+
 impl<F: PrimeField> Blake2bChip<F> {
     /// Construct a new BLAKE2b chip from the given config.
     pub fn construct(config: Blake2bConfig<F>) -> Self {
@@ -637,92 +790,630 @@ impl<F: PrimeField> Blake2bChip<F> {
         }
     }
 
-    /// Hash field-element inputs and return the BLAKE2b-256 result as 4 x 64-bit words.
+    // ---- Low-level primitives (decompose, XOR, add) ----
+
+    /// Decompose a byte to eight bits.
+    fn byte_decompose(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bits: &[AssignedCell<F, F>],
+        byte: &AssignedCell<F, F>,
+    ) -> Result<(), Error> {
+        assert_eq!(bits.len(), 8);
+        layouter.assign_region(
+            || "decompose byte to bits",
+            |mut region| {
+                self.config.s_byte_decompose.enable(&mut region, 0)?;
+                for (i, bit) in bits.iter().enumerate() {
+                    bit.copy_advice(|| "bit", &mut region, self.config.advices[i], 0)?;
+                }
+                byte.copy_advice(|| "byte", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// XOR two bytes bit-by-bit.
     ///
-    /// Each field element is decomposed into 4 x 64-bit words (with canonicality check).
-    /// Words are packed into 128-byte blocks (16 words each), compressed through
-    /// the standard BLAKE2b compression function, and the first 256 bits of the
-    /// final state are returned.
+    /// Uses arithmetic XOR: `a + b - 2*a*b` equals `a XOR b` when a, b are boolean.
+    fn byte_xor(
+        &self,
+        mut layouter: impl Layouter<F>,
+        x: &[AssignedCell<F, F>],
+        y: &[AssignedCell<F, F>],
+    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
+        assert_eq!(x.len(), 8);
+        assert_eq!(y.len(), 8);
+        layouter.assign_region(
+            || "byte xor",
+            |mut region| {
+                self.config.s_byte_xor.enable(&mut region, 1)?;
+                let xor = |x: &F, y: &F| -> F {
+                    F::from(((x.is_odd()) ^ (y.is_odd())).unwrap_u8() as u64)
+                };
+                let mut byte_ret = Vec::with_capacity(8);
+                for i in 0..8 {
+                    x[i].copy_advice(|| "xor bit x", &mut region, self.config.advices[i], 0)?;
+                    y[i].copy_advice(|| "xor bit y", &mut region, self.config.advices[i], 1)?;
+                    let result_bits = x[i]
+                        .value()
+                        .zip(y[i].value())
+                        .map(|(x_bit, y_bit)| xor(x_bit, y_bit));
+                    let ret = region.assign_advice(
+                        || "xor bit result",
+                        self.config.advices[i],
+                        2,
+                        || result_bits,
+                    )?;
+                    byte_ret.push(ret);
+                }
+
+                Ok(byte_ret)
+            },
+        )
+    }
+
+    /// XOR two 64-bit words bit-by-bit (8 bytes x 8 bits each).
+    fn word_xor(
+        &self,
+        mut layouter: impl Layouter<F>,
+        x: &[AssignedCell<F, F>],
+        y: &[AssignedCell<F, F>],
+    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
+        assert_eq!(x.len(), 64);
+        assert_eq!(y.len(), 64);
+        let mut bits = Vec::with_capacity(64);
+        for (x_byte, y_byte) in x.chunks(8).zip(y.chunks(8)) {
+            let mut ret = self.byte_xor(layouter.namespace(|| "byte xor"), x_byte, y_byte)?;
+            bits.append(&mut ret);
+        }
+
+        Ok(bits)
+    }
+
+    /// 64-bit modular addition: (x + y) mod 2^64.
+    ///
+    /// Carry is detected by checking byte index 8 of the field sum.
+    fn add_mod_u64(
+        &self,
+        mut layouter: impl Layouter<F>,
+        x: &AssignedCell<F, F>,
+        y: &AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        layouter.assign_region(
+            || "64-bit word add",
+            |mut region| {
+                self.config.s_word_add.enable(&mut region, 0)?;
+                x.copy_advice(|| "word_add x", &mut region, self.config.advices[A0], 0)?;
+                y.copy_advice(|| "word_add y", &mut region, self.config.advices[A1], 0)?;
+                let sum = x.value().zip(y.value()).map(|(&x, &y)| {
+                    let sum = x + y;
+                    // Carry detection: if x + y >= 2^64, the sum's field repr has a
+                    // nonzero 9th byte (index 8). The field is ~255 bits, so a single
+                    // addition cannot overflow the field itself.
+                    let carry = F::from(sum.to_repr().as_ref()[8] as u64);
+                    let ret = sum - carry * F::from_u128(1u128 << 64);
+                    (ret, carry)
+                });
+                let ret = region.assign_advice(
+                    || "word_add ret",
+                    self.config.advices[A0],
+                    1,
+                    || sum.map(|sum| sum.0),
+                )?;
+                region.assign_advice(
+                    || "word_add carry",
+                    self.config.advices[A1],
+                    1,
+                    || sum.map(|sum| sum.1),
+                )?;
+                Ok(ret)
+            },
+        )
+    }
+
+    /// Decompose a 64-bit word into 8 bytes.
+    fn word_decompose(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bytes: &[AssignedCell<F, F>],
+        word: &AssignedCell<F, F>,
+    ) -> Result<(), Error> {
+        assert_eq!(bytes.len(), 8);
+        layouter.assign_region(
+            || "decompose 64-bit word to bytes",
+            |mut region| {
+                self.config.s_word_decompose.enable(&mut region, 0)?;
+                for (i, byte) in bytes.iter().enumerate() {
+                    byte.copy_advice(|| "byte", &mut region, self.config.advices[i], 0)?;
+                }
+                word.copy_advice(|| "word", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Decompose a 32-bit word into 4 bytes using the 8-byte word gate with upper bytes zeroed.
+    /// Used for field decomposition and canonicality range checks.
+    fn word_decompose_32(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bytes: &[AssignedCell<F, F>],
+        word: &AssignedCell<F, F>,
+    ) -> Result<(), Error> {
+        assert_eq!(bytes.len(), 4);
+        layouter.assign_region(
+            || "decompose 32-bit word to bytes",
+            |mut region| {
+                // Note: We use a subset of the s_word_decompose gate (first 4 bytes)
+                // The gate supports up to 8 bytes but we only use 4 here
+                self.config.s_word_decompose.enable(&mut region, 0)?;
+                for (i, byte) in bytes.iter().enumerate() {
+                    byte.copy_advice(|| "byte", &mut region, self.config.advices[i], 0)?;
+                }
+                // Zero out unused bytes (5-8) for the gate constraint
+                for i in 4..8 {
+                    region.assign_advice_from_constant(
+                        || format!("zero byte {}", i),
+                        self.config.advices[i],
+                        0,
+                        F::ZERO,
+                    )?;
+                }
+                word.copy_advice(|| "word", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Assign a 32-bit word from 4 byte cells, constraining it via `word_decompose_32`.
+    fn assign_word_32_from_bytes(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bytes: &[AssignedCell<F, F>],
+    ) -> Result<AssignedCell<F, F>, Error> {
+        let word_value = word_value_from_bytes(bytes);
+        let word = assign_free_advice(
+            layouter.namespace(|| "assign 32-bit word"),
+            self.config.advices[A8],
+            word_value,
+        )?;
+        self.word_decompose_32(layouter.namespace(|| "word decompose 32"), bytes, &word)?;
+        Ok(word)
+    }
+
+    /// Assign a 64-bit word from 8 byte cells, constraining it via `word_decompose`.
+    fn assign_word_64_from_bytes(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bytes: &[AssignedCell<F, F>],
+    ) -> Result<AssignedCell<F, F>, Error> {
+        let word_value = word_value_from_bytes(bytes);
+        let word = assign_free_advice(
+            layouter.namespace(|| "assign 64-bit word"),
+            self.config.advices[A8],
+            word_value,
+        )?;
+        self.word_decompose(layouter.namespace(|| "word decompose 64"), bytes, &word)?;
+        Ok(word)
+    }
+
+    /// Assign a byte from 8 bit cells, constraining it via `byte_decompose`.
+    fn assign_byte_from_bits(
+        &self,
+        mut layouter: impl Layouter<F>,
+        bits: &[AssignedCell<F, F>],
+    ) -> Result<AssignedCell<F, F>, Error> {
+        let byte_value = byte_value_from_bits(bits);
+        let byte = assign_free_advice(
+            layouter.namespace(|| "assign byte"),
+            self.config.advices[A8],
+            byte_value,
+        )?;
+        self.byte_decompose(layouter.namespace(|| "byte decompose"), bits, &byte)?;
+        Ok(byte)
+    }
+
+    /// Combine two 32-bit words into one 64-bit word.
+    ///
+    /// Constrains: `word_64 = word_32_lo + word_32_hi * 2^32`.
+    ///
+    /// This bridges the 32-bit words (verified by the canonicality check) to the
+    /// 64-bit words used in BLAKE2b compression.
+    fn word_combine(
+        &self,
+        mut layouter: impl Layouter<F>,
+        word_32_lo: &AssignedCell<F, F>,
+        word_32_hi: &AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        layouter.assign_region(
+            || "combine two 32-bit words to 64-bit",
+            |mut region| {
+                self.config.s_word_combine.enable(&mut region, 0)?;
+
+                // Copy the 32-bit words to row 0
+                word_32_lo.copy_advice(|| "word_32_lo", &mut region, self.config.advices[A0], 0)?;
+                word_32_hi.copy_advice(|| "word_32_hi", &mut region, self.config.advices[A1], 0)?;
+
+                // Compute and assign the 64-bit word to row 1
+                let word_64_value = word_32_lo
+                    .value()
+                    .zip(word_32_hi.value())
+                    .map(|(&lo, &hi)| lo + hi * F::from(1u64 << 32));
+
+                region.assign_advice(|| "word_64", self.config.advices[A0], 1, || word_64_value)
+            },
+        )
+    }
+
+    // ---- Field decomposition and canonicality ----
+
+    /// Decompose a field element into 4 x 64-bit `Blake2bWord`s.
+    ///
+    /// Pipeline: field → 32 bytes → 256 bits → 8 x 32-bit words → field
+    /// decomposition check → canonicality check (value < p) → 4 x 64-bit
+    /// words via `word_combine`.
+    fn field_decompose(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        field: &AssignedCell<F, F>,
+    ) -> Result<Vec<Blake2bWord<F>>, Error> {
+        // the decomposition from bytes to bits
+        let mut bits = vec![];
+        let mut bytes = vec![];
+        for i in 0..32 {
+            let byte_value = field.value().map(|f| f.to_repr().as_ref()[i]);
+            let byte =
+                Blake2bByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &self.config)?;
+            bits.append(&mut byte.get_bits().to_vec());
+            bytes.push(byte.get_byte());
+        }
+
+        // Check the decomposition from 32-bit words to bytes
+        // Note: We use 32-bit words here for field decomposition gate and canonicality check
+        let mut words_32 = vec![];
+        for bytes in bytes.chunks(4) {
+            let word =
+                self.assign_word_32_from_bytes(layouter.namespace(|| "assign word"), bytes)?;
+            words_32.push(word);
+        }
+
+        // check the decomposition from field to 32-bit words
+        layouter.assign_region(
+            || "decompose field to words",
+            |mut region| {
+                self.config.s_field_decompose.enable(&mut region, 0)?;
+                for (i, word) in words_32.iter().enumerate() {
+                    word.copy_advice(|| "word", &mut region, self.config.advices[i], 0)?;
+                }
+                field.copy_advice(|| "field", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )?;
+
+        // Canonicality: ensure the 256-bit decomposition is strictly less than p.
+        // Without this, a prover could use the non-canonical representation (value + p).
+        self.check_canonicality(layouter, &bits, &words_32)?;
+
+        // Combine pairs of 32-bit words into 64-bit words for BLAKE2b operations.
+        // Each pair is constrained: word_64 = word_32_lo + word_32_hi * 2^32.
+        let mut res = Vec::with_capacity(4);
+        for (i, chunk) in bits.chunks(64).enumerate() {
+            // Combine two adjacent 32-bit words into one 64-bit word with constraint
+            let word_64 = self.word_combine(
+                layouter.namespace(|| format!("combine 32-bit words to 64-bit word {}", i)),
+                &words_32[i * 2],
+                &words_32[i * 2 + 1],
+            )?;
+            res.push(Blake2bWord {
+                word: word_64,
+                bits: chunk.to_vec().try_into().unwrap(),
+            });
+        }
+
+        Ok(res)
+    }
+
+    /// Check that the 256-bit decomposition is canonical (strictly less than p).
+    ///
+    /// This is a critical soundness check. Without it, a malicious prover could
+    /// decompose a field element f as either f or f+p (both satisfy the mod-p
+    /// constraint), leading to different BLAKE2b outputs for the "same" field value.
+    ///
+    /// The check uses the 256 bits directly:
+    /// 1. bit[255] must be 0
+    /// 2. If bit[254] = 1, bits[253..128] must all be 0
+    /// 3. If bit[254] = 1, lower 128 bits must be < p's lower 128 bits
+    ///
+    /// All witness values are properly constrained via copy_advice to ensure
+    /// they match the actual bit and word cells from field decomposition.
+    ///
+    /// The diff value (p_lower - 1 - lower_128) is decomposed into 4 words,
+    /// and each word is range-checked via s_word_decompose to ensure diff >= 0.
+    fn check_canonicality(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        bits: &[AssignedCell<F, F>],
+        words: &[AssignedCell<F, F>],
+    ) -> Result<(), Error> {
+        assert_eq!(bits.len(), 256);
+        assert_eq!(words.len(), 8);
+
+        // Extract key bits
+        let bit_255 = &bits[255];
+        let bit_254 = &bits[254];
+
+        let (lower_128, diff, diff_word_values) = self.compute_lower_128_and_diff(words);
+        let diff_word_cells = self.assign_canonicality_region(
+            layouter,
+            bit_255,
+            bit_254,
+            words,
+            lower_128,
+            diff,
+            &diff_word_values,
+        )?;
+        self.apply_high_bit_zero_checks(layouter, bit_254, bits)?;
+        self.range_check_diff_words(layouter, &diff_word_values, &diff_word_cells)?;
+
+        Ok(())
+    }
+
+    /// Compute witness values for the canonicality gate: extracts the lower 128 bits
+    /// of the field element and computes `diff = p_lower - 1 - lower_128`. Returns
+    /// both values plus the 4-word decomposition of diff.
+    fn compute_lower_128_and_diff(
+        &self,
+        words: &[AssignedCell<F, F>],
+    ) -> (Value<u128>, Value<u128>, [Value<u32>; 4]) {
+        // Compute lower 128 bits as a field element
+        // lower_128 = word_1 + word_2 * 2^32 + word_3 * 2^64 + word_4 * 2^96
+        let lower_128: Value<u128> = words[0]
+            .value()
+            .zip(words[1].value())
+            .zip(words[2].value())
+            .zip(words[3].value())
+            .map(|(((w1, w2), w3), w4)| {
+                (f_to_u32_le(w1) as u128)
+                    + ((f_to_u32_le(w2) as u128) << 32)
+                    + ((f_to_u32_le(w3) as u128) << 64)
+                    + ((f_to_u32_le(w4) as u128) << 96)
+            });
+
+        // Compute diff = p_lower - 1 - lower_128
+        // If lower_128 < p_lower, diff is in [0, p_lower - 1]
+        // If lower_128 >= p_lower, diff would be "negative" (wrap around)
+        let p_lower = PALLAS_MODULUS_LOWER_128;
+        let diff: Value<u128> = lower_128.map(|l| {
+            if l < p_lower {
+                p_lower - 1 - l
+            } else {
+                // This case should never happen for canonical values
+                // Set to 0; the constraint will fail
+                0
+            }
+        });
+
+        // Decompose diff into 4 32-bit words for range checking
+        let diff_word_values: [Value<u32>; 4] = [
+            diff.map(|d| d as u32),
+            diff.map(|d| (d >> 32) as u32),
+            diff.map(|d| (d >> 64) as u32),
+            diff.map(|d| (d >> 96) as u32),
+        ];
+
+        (lower_128, diff, diff_word_values)
+    }
+
+    /// Assign the canonicality check region: copies bit_255, bit_254, and the lower
+    /// 4 words via copy_advice (constraining them to the actual decomposition), then
+    /// witnesses diff and its word decomposition.
+    #[allow(clippy::too_many_arguments)]
+    fn assign_canonicality_region(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        bit_255: &AssignedCell<F, F>,
+        bit_254: &AssignedCell<F, F>,
+        words: &[AssignedCell<F, F>],
+        lower_128: Value<u128>,
+        diff: Value<u128>,
+        diff_word_values: &[Value<u32>; 4],
+    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
+        // Assign the canonicality check region and get back the diff_word cells
+        // for range checking. All bits and words are copied via copy_advice.
+        layouter.assign_region(
+            || "canonicality check",
+            |mut region| {
+                self.config.s_canonicality.enable(&mut region, 0)?;
+
+                // Row 0: bit_255, bit_254, lower_128_diff, diff_w1..diff_w4, w1, w2, w3
+                // Use copy_advice to constrain these to the actual bit/word cells
+                bit_255.copy_advice(|| "bit_255", &mut region, self.config.advices[A0], 0)?;
+                bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[A1], 0)?;
+
+                // Witness the diff value
+                let diff_field = diff.map(|d| F::from_u128(d));
+                region.assign_advice(
+                    || "lower_128_diff",
+                    self.config.advices[A2],
+                    0,
+                    || diff_field,
+                )?;
+
+                // Assign diff words and collect the cells for later range checking
+                let mut diff_cells = Vec::with_capacity(4);
+                for (i, dw) in diff_word_values.iter().enumerate() {
+                    let cell = region.assign_advice(
+                        || format!("diff_word_{}", i + 1),
+                        self.config.advices[A3 + i],
+                        0,
+                        || dw.map(|w| F::from(w as u64)),
+                    )?;
+                    diff_cells.push(cell);
+                }
+
+                // Copy words[0..4] using copy_advice to constrain lower_128
+                words[0].copy_advice(|| "word_1", &mut region, self.config.advices[A7], 0)?;
+                words[1].copy_advice(|| "word_2", &mut region, self.config.advices[A8], 0)?;
+                words[2].copy_advice(|| "word_3", &mut region, self.config.advices[A9], 0)?;
+
+                // Row 1: word_4, lower_128
+                words[3].copy_advice(|| "word_4", &mut region, self.config.advices[A0], 1)?;
+
+                // Assign lower_128 - this is constrained by the gate to equal
+                // word_1 + word_2*2^32 + word_3*2^64 + word_4*2^96
+                let lower_128_field = lower_128.map(|l| F::from_u128(l));
+                region.assign_advice(
+                    || "lower_128",
+                    self.config.advices[A1],
+                    1,
+                    || lower_128_field,
+                )?;
+
+                Ok(diff_cells)
+            },
+        )
+    }
+
+    fn apply_high_bit_zero_checks(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        bit_254: &AssignedCell<F, F>,
+        bits: &[AssignedCell<F, F>],
+    ) -> Result<(), Error> {
+        // Apply s_high_bit_zero gate to each bit in [128..254]
+        // This constrains: bit_254 * bit[i] = 0 for each bit
+        // Using copy_advice ensures we're checking the actual bits
+        for (i, bit) in bits[128..254].iter().enumerate() {
+            layouter.assign_region(
+                || format!("high bit zero check {}", i),
+                |mut region| {
+                    self.config.s_high_bit_zero.enable(&mut region, 0)?;
+                    bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[A0], 0)?;
+                    bit.copy_advice(|| "bit_to_check", &mut region, self.config.advices[A1], 0)?;
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn range_check_diff_words(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        diff_word_values: &[Value<u32>; 4],
+        diff_word_cells: &[AssignedCell<F, F>],
+    ) -> Result<(), Error> {
+        // Range-check each diff word by decomposing it to bytes
+        // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
+        // The diff_word_cells are the SAME cells from the canonicality region
+        for (i, (dw_val, dw_cell)) in diff_word_values
+            .iter()
+            .zip(diff_word_cells.iter())
+            .enumerate()
+        {
+            // Decompose each diff word into 4 bytes, then each byte into bits
+            // The bit boolean constraints will ensure each word is in [0, 2^32 - 1]
+            let mut diff_bytes = Vec::with_capacity(4);
+            for j in 0..4 {
+                let byte_val = dw_val.map(|w| ((w >> (j * 8)) & 0xFF) as u8);
+                let byte = Blake2bByte::from_u8(
+                    byte_val,
+                    layouter.namespace(|| format!("diff_word_{}_byte_{}", i, j)),
+                    &self.config,
+                )?;
+                diff_bytes.push(byte.get_byte());
+            }
+
+            // Use the SAME diff_word cell from the canonicality region
+            // This ensures the range-checked word is the same as the one in the constraint
+            // Note: diff_words are 32-bit for canonicality check
+            self.word_decompose_32(
+                layouter.namespace(|| format!("diff_word_{}_decompose", i)),
+                &diff_bytes,
+                dw_cell,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Decompose raw bytes to Blake2bWords without field interpretation.
+    ///
+    /// Unlike field_decompose(), this function does NOT perform canonicality checks
+    /// because the input bytes may represent arbitrary data (like curve points or
+    /// ciphertext) that can exceed the field modulus.
+    ///
+    /// Each byte is decomposed to 8 bits with boolean constraints, ensuring the
+    /// bytes are well-formed even without canonicality.
     ///
     /// # Arguments
     /// * `layouter` - The circuit layouter
-    /// * `inputs` - The input field elements (must be even length)
-    /// * `personalization` - 16-byte personalization string
-    pub fn process(
+    /// * `bytes` - The input bytes (each cell holds one byte value 0-255)
+    ///
+    /// # Returns
+    /// A vector of Blake2bWords constructed from the input bytes.
+    /// The bytes are packed into 64-bit words in little-endian order.
+    pub fn bytes_to_words(
         &self,
         layouter: &mut impl Layouter<F>,
-        inputs: &[AssignedCell<F, F>],
-        personalization: &[u8],
+        bytes: &[AssignedCell<F, F>],
     ) -> Result<Vec<Blake2bWord<F>>, Error> {
-        assert_eq!(personalization.len(), 16);
-        assert!(inputs.len() % 2 == 0);
+        let mut all_bits = Vec::with_capacity((bytes.len() + 7) / 8 * 64);
 
-        // Initialize state: h[0] = IV[0] XOR parameter block (0x01010000 | nn=32),
-        // h[6..7] = IV[6..7] XOR personalization (RFC 7693, Section 2.5).
-        let mut h = vec![
-            Blake2bWord::from_constant_u64(IV[0] ^ 0x01010000 ^ 32, layouter, self)?,
-            Blake2bWord::from_constant_u64(IV[1], layouter, self)?,
-            Blake2bWord::from_constant_u64(IV[2], layouter, self)?,
-            Blake2bWord::from_constant_u64(IV[3], layouter, self)?,
-            Blake2bWord::from_constant_u64(IV[4], layouter, self)?,
-            Blake2bWord::from_constant_u64(IV[5], layouter, self)?,
-            Blake2bWord::from_constant_u64(
-                IV[6] ^ LittleEndian::read_u64(&personalization[0..8]),
-                layouter,
-                self,
-            )?,
-            Blake2bWord::from_constant_u64(
-                IV[7] ^ LittleEndian::read_u64(&personalization[8..16]),
-                layouter,
-                self,
-            )?,
-        ];
+        // Decompose each byte to 8 bits with boolean constraints
+        for (i, byte_cell) in bytes.iter().enumerate() {
+            // Get the byte value from the cell
+            let byte_value = byte_cell.value().map(|f| f_to_u8_le(f));
 
-        // Convert field elements to 128-byte blocks.
-        // Each field element (32 bytes) yields 4 x 64-bit words.
-        // One BLAKE2b block = 128 bytes = 16 words = 4 field elements.
-        let mut blocks = vec![];
-        for block_fields in inputs.chunks(4) {
-            let mut cur_block = Vec::with_capacity(16);
-            for field in block_fields.iter() {
-                let mut words = self.field_decompose(layouter, field)?;
-                cur_block.append(&mut words);
+            // Create bits for this byte
+            let mut byte_bits = Vec::with_capacity(8);
+            for j in 0..8 {
+                let bit_value = byte_value.map(|b| F::from(((b >> j) & 1) as u64));
+                let bit = assign_free_advice(
+                    layouter.namespace(|| format!("byte_{}_bit_{}", i, j)),
+                    self.config.advices[A0],
+                    bit_value,
+                )?;
+                byte_bits.push(bit);
             }
-            // Pad with zeros if we don't have 16 words (partial last block)
-            while cur_block.len() < 16 {
-                cur_block.push(Blake2bWord::from_constant_u64(0, layouter, self)?);
-            }
-            blocks.push(cur_block);
+
+            // Constrain: byte = sum of bits * 2^i, and each bit is boolean
+            // Uses the s_byte_decompose gate
+            self.byte_decompose(
+                layouter.namespace(|| format!("decompose_byte_{}", i)),
+                &byte_bits,
+                byte_cell,
+            )?;
+
+            all_bits.extend(byte_bits);
         }
 
-        if blocks.is_empty() {
-            // Empty input - use zero padding block
-            let zero_padding_block = (0..16)
-                .map(|_| Blake2bWord::from_constant_u64(0, layouter, self).unwrap())
-                .collect();
-            blocks.push(zero_padding_block);
+        // Pad with zero bits to reach a multiple of 64
+        let padding_needed = (64 - (all_bits.len() % 64)) % 64;
+        for i in 0..padding_needed {
+            let zero_bit = assign_free_constant(
+                layouter.namespace(|| format!("zero_padding_bit_{}", i)),
+                self.config.advices[A0],
+                F::ZERO,
+            )?;
+            all_bits.push(zero_bit);
         }
 
-        let block_len = blocks.len();
-
-        // Compress intermediate blocks with cumulative byte counter
-        for (i, block) in blocks[0..(block_len - 1)].iter().enumerate() {
-            self.compress(layouter, &mut h, block, (i as u128 + 1) * 128, false)?;
+        // Convert bits to 64-bit words
+        let mut words = Vec::with_capacity(all_bits.len() / 64);
+        for (i, chunk) in all_bits.chunks(64).enumerate() {
+            let word = Blake2bWord::from_bits(
+                self,
+                layouter.namespace(|| format!("word_from_bytes_{}", i)),
+                chunk.to_vec(),
+            )?;
+            words.push(word);
         }
 
-        // Compress final block with total byte count and finalization flag
-        let total_bytes = inputs.len() as u128 * 32;
-        self.compress(
-            layouter,
-            &mut h,
-            &blocks[block_len - 1],
-            total_bytes.max(128),
-            true,
-        )?;
-
-        // Return first 4 words (256 bits) for BLAKE2b-256
-        Ok(h[0..4].to_vec())
+        Ok(words)
     }
+
+    // ---- Public API (hashing) ----
 
     /// Process mixed field elements and raw bytes for compact action hash.
     ///
@@ -862,6 +1553,8 @@ impl<F: PrimeField> Blake2bChip<F> {
         assert_eq!(fields.len(), 2);
         Ok(fields.try_into().unwrap())
     }
+
+    // ---- BLAKE2b compression ----
 
     /// Compression function F takes as an argument the state vector "h",
     /// message block vector "m" (last block is padded with zeros to full
@@ -1143,721 +1836,5 @@ impl<F: PrimeField> Blake2bChip<F> {
         };
 
         Ok(())
-    }
-
-    /// Decompose a field element into 4 x 64-bit `Blake2bWord`s.
-    ///
-    /// Pipeline: field → 32 bytes → 256 bits → 8 x 32-bit words → field
-    /// decomposition check → canonicality check (value < p) → 4 x 64-bit
-    /// words via `word_combine`.
-    fn field_decompose(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        field: &AssignedCell<F, F>,
-    ) -> Result<Vec<Blake2bWord<F>>, Error> {
-        // the decomposition from bytes to bits
-        let mut bits = vec![];
-        let mut bytes = vec![];
-        for i in 0..32 {
-            let byte_value = field.value().map(|f| f.to_repr().as_ref()[i]);
-            let byte =
-                Blake2bByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &self.config)?;
-            bits.append(&mut byte.get_bits().to_vec());
-            bytes.push(byte.get_byte());
-        }
-
-        // Check the decomposition from 32-bit words to bytes
-        // Note: We use 32-bit words here for field decomposition gate and canonicality check
-        let mut words_32 = vec![];
-        for bytes in bytes.chunks(4) {
-            let word =
-                self.assign_word_32_from_bytes(layouter.namespace(|| "assign word"), bytes)?;
-            words_32.push(word);
-        }
-
-        // check the decomposition from field to 32-bit words
-        layouter.assign_region(
-            || "decompose field to words",
-            |mut region| {
-                self.config.s_field_decompose.enable(&mut region, 0)?;
-                for (i, word) in words_32.iter().enumerate() {
-                    word.copy_advice(|| "word", &mut region, self.config.advices[i], 0)?;
-                }
-                field.copy_advice(|| "field", &mut region, self.config.advices[A0], 1)?;
-                Ok(())
-            },
-        )?;
-
-        // Canonicality: ensure the 256-bit decomposition is strictly less than p.
-        // Without this, a prover could use the non-canonical representation (value + p).
-        self.check_canonicality(layouter, &bits, &words_32)?;
-
-        // Combine pairs of 32-bit words into 64-bit words for BLAKE2b operations.
-        // Each pair is constrained: word_64 = word_32_lo + word_32_hi * 2^32.
-        let mut res = Vec::with_capacity(4);
-        for (i, chunk) in bits.chunks(64).enumerate() {
-            // Combine two adjacent 32-bit words into one 64-bit word with constraint
-            let word_64 = self.word_combine(
-                layouter.namespace(|| format!("combine 32-bit words to 64-bit word {}", i)),
-                &words_32[i * 2],
-                &words_32[i * 2 + 1],
-            )?;
-            res.push(Blake2bWord {
-                word: word_64,
-                bits: chunk.to_vec().try_into().unwrap(),
-            });
-        }
-
-        Ok(res)
-    }
-
-    /// Check that the 256-bit decomposition is canonical (strictly less than p).
-    ///
-    /// This is a critical soundness check. Without it, a malicious prover could
-    /// decompose a field element f as either f or f+p (both satisfy the mod-p
-    /// constraint), leading to different BLAKE2b outputs for the "same" field value.
-    ///
-    /// The check uses the 256 bits directly:
-    /// 1. bit[255] must be 0
-    /// 2. If bit[254] = 1, bits[253..128] must all be 0
-    /// 3. If bit[254] = 1, lower 128 bits must be < p's lower 128 bits
-    ///
-    /// All witness values are properly constrained via copy_advice to ensure
-    /// they match the actual bit and word cells from field decomposition.
-    ///
-    /// The diff value (p_lower - 1 - lower_128) is decomposed into 4 words,
-    /// and each word is range-checked via s_word_decompose to ensure diff >= 0.
-    fn check_canonicality(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        bits: &[AssignedCell<F, F>],
-        words: &[AssignedCell<F, F>],
-    ) -> Result<(), Error> {
-        assert_eq!(bits.len(), 256);
-        assert_eq!(words.len(), 8);
-
-        // Extract key bits
-        let bit_255 = &bits[255];
-        let bit_254 = &bits[254];
-
-        let (lower_128, diff, diff_word_values) = self.compute_lower_128_and_diff(words);
-        let diff_word_cells = self.assign_canonicality_region(
-            layouter,
-            bit_255,
-            bit_254,
-            words,
-            lower_128,
-            diff,
-            &diff_word_values,
-        )?;
-        self.apply_high_bit_zero_checks(layouter, bit_254, bits)?;
-        self.range_check_diff_words(layouter, &diff_word_values, &diff_word_cells)?;
-
-        Ok(())
-    }
-
-    /// Decompose a 32-bit word into 4 bytes using the 8-byte word gate with upper bytes zeroed.
-    /// Used for field decomposition and canonicality range checks.
-    fn word_decompose_32(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bytes: &[AssignedCell<F, F>],
-        word: &AssignedCell<F, F>,
-    ) -> Result<(), Error> {
-        assert_eq!(bytes.len(), 4);
-        layouter.assign_region(
-            || "decompose 32-bit word to bytes",
-            |mut region| {
-                // Note: We use a subset of the s_word_decompose gate (first 4 bytes)
-                // The gate supports up to 8 bytes but we only use 4 here
-                self.config.s_word_decompose.enable(&mut region, 0)?;
-                for (i, byte) in bytes.iter().enumerate() {
-                    byte.copy_advice(|| "byte", &mut region, self.config.advices[i], 0)?;
-                }
-                // Zero out unused bytes (5-8) for the gate constraint
-                for i in 4..8 {
-                    region.assign_advice_from_constant(
-                        || format!("zero byte {}", i),
-                        self.config.advices[i],
-                        0,
-                        F::ZERO,
-                    )?;
-                }
-                word.copy_advice(|| "word", &mut region, self.config.advices[A0], 1)?;
-                Ok(())
-            },
-        )
-    }
-
-    /// Decompose a 64-bit word into 8 bytes.
-    fn word_decompose(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bytes: &[AssignedCell<F, F>],
-        word: &AssignedCell<F, F>,
-    ) -> Result<(), Error> {
-        assert_eq!(bytes.len(), 8);
-        layouter.assign_region(
-            || "decompose 64-bit word to bytes",
-            |mut region| {
-                self.config.s_word_decompose.enable(&mut region, 0)?;
-                for (i, byte) in bytes.iter().enumerate() {
-                    byte.copy_advice(|| "byte", &mut region, self.config.advices[i], 0)?;
-                }
-                word.copy_advice(|| "word", &mut region, self.config.advices[A0], 1)?;
-                Ok(())
-            },
-        )
-    }
-
-    fn assign_word_32_from_bytes(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bytes: &[AssignedCell<F, F>],
-    ) -> Result<AssignedCell<F, F>, Error> {
-        let word_value = word_value_from_bytes(bytes);
-        let word = assign_free_advice(
-            layouter.namespace(|| "assign 32-bit word"),
-            self.config.advices[A8],
-            word_value,
-        )?;
-        self.word_decompose_32(layouter.namespace(|| "word decompose 32"), bytes, &word)?;
-        Ok(word)
-    }
-
-    fn assign_word_64_from_bytes(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bytes: &[AssignedCell<F, F>],
-    ) -> Result<AssignedCell<F, F>, Error> {
-        let word_value = word_value_from_bytes(bytes);
-        let word = assign_free_advice(
-            layouter.namespace(|| "assign 64-bit word"),
-            self.config.advices[A8],
-            word_value,
-        )?;
-        self.word_decompose(layouter.namespace(|| "word decompose 64"), bytes, &word)?;
-        Ok(word)
-    }
-
-    fn assign_byte_from_bits(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bits: &[AssignedCell<F, F>],
-    ) -> Result<AssignedCell<F, F>, Error> {
-        let byte_value = byte_value_from_bits(bits);
-        let byte = assign_free_advice(
-            layouter.namespace(|| "assign byte"),
-            self.config.advices[A8],
-            byte_value,
-        )?;
-        self.byte_decompose(layouter.namespace(|| "byte decompose"), bits, &byte)?;
-        Ok(byte)
-    }
-
-    fn compute_lower_128_and_diff(
-        &self,
-        words: &[AssignedCell<F, F>],
-    ) -> (Value<u128>, Value<u128>, [Value<u32>; 4]) {
-        // Compute lower 128 bits as a field element
-        // lower_128 = word_1 + word_2 * 2^32 + word_3 * 2^64 + word_4 * 2^96
-        let lower_128: Value<u128> = words[0]
-            .value()
-            .zip(words[1].value())
-            .zip(words[2].value())
-            .zip(words[3].value())
-            .map(|(((w1, w2), w3), w4)| {
-                (f_to_u32_le(w1) as u128)
-                    + ((f_to_u32_le(w2) as u128) << 32)
-                    + ((f_to_u32_le(w3) as u128) << 64)
-                    + ((f_to_u32_le(w4) as u128) << 96)
-            });
-
-        // Compute diff = p_lower - 1 - lower_128
-        // If lower_128 < p_lower, diff is in [0, p_lower - 1]
-        // If lower_128 >= p_lower, diff would be "negative" (wrap around)
-        let p_lower = PALLAS_MODULUS_LOWER_128;
-        let diff: Value<u128> = lower_128.map(|l| {
-            if l < p_lower {
-                p_lower - 1 - l
-            } else {
-                // This case should never happen for canonical values
-                // Set to 0; the constraint will fail
-                0
-            }
-        });
-
-        // Decompose diff into 4 32-bit words for range checking
-        let diff_word_values: [Value<u32>; 4] = [
-            diff.map(|d| d as u32),
-            diff.map(|d| (d >> 32) as u32),
-            diff.map(|d| (d >> 64) as u32),
-            diff.map(|d| (d >> 96) as u32),
-        ];
-
-        (lower_128, diff, diff_word_values)
-    }
-
-    fn assign_canonicality_region(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        bit_255: &AssignedCell<F, F>,
-        bit_254: &AssignedCell<F, F>,
-        words: &[AssignedCell<F, F>],
-        lower_128: Value<u128>,
-        diff: Value<u128>,
-        diff_word_values: &[Value<u32>; 4],
-    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
-        // Assign the canonicality check region and get back the diff_word cells
-        // for range checking. All bits and words are copied via copy_advice.
-        layouter.assign_region(
-            || "canonicality check",
-            |mut region| {
-                self.config.s_canonicality.enable(&mut region, 0)?;
-
-                // Row 0: bit_255, bit_254, lower_128_diff, diff_w1..diff_w4, w1, w2, w3
-                // Use copy_advice to constrain these to the actual bit/word cells
-                bit_255.copy_advice(|| "bit_255", &mut region, self.config.advices[A0], 0)?;
-                bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[A1], 0)?;
-
-                // Witness the diff value
-                let diff_field = diff.map(|d| F::from_u128(d));
-                region.assign_advice(
-                    || "lower_128_diff",
-                    self.config.advices[A2],
-                    0,
-                    || diff_field,
-                )?;
-
-                // Assign diff words and collect the cells for later range checking
-                let mut diff_cells = Vec::with_capacity(4);
-                for (i, dw) in diff_word_values.iter().enumerate() {
-                    let cell = region.assign_advice(
-                        || format!("diff_word_{}", i + 1),
-                        self.config.advices[A3 + i],
-                        0,
-                        || dw.map(|w| F::from(w as u64)),
-                    )?;
-                    diff_cells.push(cell);
-                }
-
-                // Copy words[0..4] using copy_advice to constrain lower_128
-                words[0].copy_advice(|| "word_1", &mut region, self.config.advices[A7], 0)?;
-                words[1].copy_advice(|| "word_2", &mut region, self.config.advices[A8], 0)?;
-                words[2].copy_advice(|| "word_3", &mut region, self.config.advices[A9], 0)?;
-
-                // Row 1: word_4, lower_128
-                words[3].copy_advice(|| "word_4", &mut region, self.config.advices[A0], 1)?;
-
-                // Assign lower_128 - this is constrained by the gate to equal
-                // word_1 + word_2*2^32 + word_3*2^64 + word_4*2^96
-                let lower_128_field = lower_128.map(|l| F::from_u128(l));
-                region.assign_advice(
-                    || "lower_128",
-                    self.config.advices[A1],
-                    1,
-                    || lower_128_field,
-                )?;
-
-                Ok(diff_cells)
-            },
-        )
-    }
-
-    fn apply_high_bit_zero_checks(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        bit_254: &AssignedCell<F, F>,
-        bits: &[AssignedCell<F, F>],
-    ) -> Result<(), Error> {
-        // Apply s_high_bit_zero gate to each bit in [128..254]
-        // This constrains: bit_254 * bit[i] = 0 for each bit
-        // Using copy_advice ensures we're checking the actual bits
-        for (i, bit) in bits[128..254].iter().enumerate() {
-            layouter.assign_region(
-                || format!("high bit zero check {}", i),
-                |mut region| {
-                    self.config.s_high_bit_zero.enable(&mut region, 0)?;
-                    bit_254.copy_advice(|| "bit_254", &mut region, self.config.advices[A0], 0)?;
-                    bit.copy_advice(|| "bit_to_check", &mut region, self.config.advices[A1], 0)?;
-                    Ok(())
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn range_check_diff_words(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        diff_word_values: &[Value<u32>; 4],
-        diff_word_cells: &[AssignedCell<F, F>],
-    ) -> Result<(), Error> {
-        // Range-check each diff word by decomposing it to bytes
-        // This ensures diff is in [0, 2^128 - 1], proving lower_128 < p_lower
-        // The diff_word_cells are the SAME cells from the canonicality region
-        for (i, (dw_val, dw_cell)) in diff_word_values
-            .iter()
-            .zip(diff_word_cells.iter())
-            .enumerate()
-        {
-            // Decompose each diff word into 4 bytes, then each byte into bits
-            // The bit boolean constraints will ensure each word is in [0, 2^32 - 1]
-            let mut diff_bytes = Vec::with_capacity(4);
-            for j in 0..4 {
-                let byte_val = dw_val.map(|w| ((w >> (j * 8)) & 0xFF) as u8);
-                let byte = Blake2bByte::from_u8(
-                    byte_val,
-                    layouter.namespace(|| format!("diff_word_{}_byte_{}", i, j)),
-                    &self.config,
-                )?;
-                diff_bytes.push(byte.get_byte());
-            }
-
-            // Use the SAME diff_word cell from the canonicality region
-            // This ensures the range-checked word is the same as the one in the constraint
-            // Note: diff_words are 32-bit for canonicality check
-            self.word_decompose_32(
-                layouter.namespace(|| format!("diff_word_{}_decompose", i)),
-                &diff_bytes,
-                dw_cell,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Combine two 32-bit words into one 64-bit word.
-    ///
-    /// Constrains: `word_64 = word_32_lo + word_32_hi * 2^32`.
-    ///
-    /// This bridges the 32-bit words (verified by the canonicality check) to the
-    /// 64-bit words used in BLAKE2b compression.
-    fn word_combine(
-        &self,
-        mut layouter: impl Layouter<F>,
-        word_32_lo: &AssignedCell<F, F>,
-        word_32_hi: &AssignedCell<F, F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
-        layouter.assign_region(
-            || "combine two 32-bit words to 64-bit",
-            |mut region| {
-                self.config.s_word_combine.enable(&mut region, 0)?;
-
-                // Copy the 32-bit words to row 0
-                word_32_lo.copy_advice(|| "word_32_lo", &mut region, self.config.advices[A0], 0)?;
-                word_32_hi.copy_advice(|| "word_32_hi", &mut region, self.config.advices[A1], 0)?;
-
-                // Compute and assign the 64-bit word to row 1
-                let word_64_value = word_32_lo
-                    .value()
-                    .zip(word_32_hi.value())
-                    .map(|(&lo, &hi)| lo + hi * F::from(1u64 << 32));
-
-                region.assign_advice(|| "word_64", self.config.advices[A0], 1, || word_64_value)
-            },
-        )
-    }
-
-    /// Decompose raw bytes to Blake2bWords without field interpretation.
-    ///
-    /// Unlike field_decompose(), this function does NOT perform canonicality checks
-    /// because the input bytes may represent arbitrary data (like curve points or
-    /// ciphertext) that can exceed the field modulus.
-    ///
-    /// Each byte is decomposed to 8 bits with boolean constraints, ensuring the
-    /// bytes are well-formed even without canonicality.
-    ///
-    /// # Arguments
-    /// * `layouter` - The circuit layouter
-    /// * `bytes` - The input bytes (each cell holds one byte value 0-255)
-    ///
-    /// # Returns
-    /// A vector of Blake2bWords constructed from the input bytes.
-    /// The bytes are packed into 64-bit words in little-endian order.
-    pub fn bytes_to_words(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        bytes: &[AssignedCell<F, F>],
-    ) -> Result<Vec<Blake2bWord<F>>, Error> {
-        let mut all_bits = Vec::with_capacity((bytes.len() + 7) / 8 * 64);
-
-        // Decompose each byte to 8 bits with boolean constraints
-        for (i, byte_cell) in bytes.iter().enumerate() {
-            // Get the byte value from the cell
-            let byte_value = byte_cell.value().map(|f| f_to_u8_le(f));
-
-            // Create bits for this byte
-            let mut byte_bits = Vec::with_capacity(8);
-            for j in 0..8 {
-                let bit_value = byte_value.map(|b| F::from(((b >> j) & 1) as u64));
-                let bit = assign_free_advice(
-                    layouter.namespace(|| format!("byte_{}_bit_{}", i, j)),
-                    self.config.advices[A0],
-                    bit_value,
-                )?;
-                byte_bits.push(bit);
-            }
-
-            // Constrain: byte = sum of bits * 2^i, and each bit is boolean
-            // Uses the s_byte_decompose gate
-            self.byte_decompose(
-                layouter.namespace(|| format!("decompose_byte_{}", i)),
-                &byte_bits,
-                byte_cell,
-            )?;
-
-            all_bits.extend(byte_bits);
-        }
-
-        // Pad with zero bits to reach a multiple of 64
-        let padding_needed = (64 - (all_bits.len() % 64)) % 64;
-        for i in 0..padding_needed {
-            let zero_bit = assign_free_constant(
-                layouter.namespace(|| format!("zero_padding_bit_{}", i)),
-                self.config.advices[A0],
-                F::ZERO,
-            )?;
-            all_bits.push(zero_bit);
-        }
-
-        // Convert bits to 64-bit words
-        let mut words = Vec::with_capacity(all_bits.len() / 64);
-        for (i, chunk) in all_bits.chunks(64).enumerate() {
-            let word = Blake2bWord::from_bits(
-                self,
-                layouter.namespace(|| format!("word_from_bytes_{}", i)),
-                chunk.to_vec(),
-            )?;
-            words.push(word);
-        }
-
-        Ok(words)
-    }
-
-    /// Decompose a byte to eight bits.
-    fn byte_decompose(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bits: &[AssignedCell<F, F>],
-        byte: &AssignedCell<F, F>,
-    ) -> Result<(), Error> {
-        assert_eq!(bits.len(), 8);
-        layouter.assign_region(
-            || "decompose byte to bits",
-            |mut region| {
-                self.config.s_byte_decompose.enable(&mut region, 0)?;
-                for (i, bit) in bits.iter().enumerate() {
-                    bit.copy_advice(|| "bit", &mut region, self.config.advices[i], 0)?;
-                }
-                byte.copy_advice(|| "byte", &mut region, self.config.advices[A0], 1)?;
-                Ok(())
-            },
-        )
-    }
-
-    fn byte_xor(
-        &self,
-        mut layouter: impl Layouter<F>,
-        x: &[AssignedCell<F, F>],
-        y: &[AssignedCell<F, F>],
-    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
-        assert_eq!(x.len(), 8);
-        assert_eq!(y.len(), 8);
-        layouter.assign_region(
-            || "byte xor",
-            |mut region| {
-                self.config.s_byte_xor.enable(&mut region, 1)?;
-                let xor = |x: &F, y: &F| -> F {
-                    F::from(((x.is_odd()) ^ (y.is_odd())).unwrap_u8() as u64)
-                };
-                let mut byte_ret = Vec::with_capacity(8);
-                for i in 0..8 {
-                    x[i].copy_advice(|| "xor bit x", &mut region, self.config.advices[i], 0)?;
-                    y[i].copy_advice(|| "xor bit y", &mut region, self.config.advices[i], 1)?;
-                    let result_bits = x[i]
-                        .value()
-                        .zip(y[i].value())
-                        .map(|(x_bit, y_bit)| xor(x_bit, y_bit));
-                    let ret = region.assign_advice(
-                        || "xor bit result",
-                        self.config.advices[i],
-                        2,
-                        || result_bits,
-                    )?;
-                    byte_ret.push(ret);
-                }
-
-                Ok(byte_ret)
-            },
-        )
-    }
-
-    /// XOR two 64-bit words bit-by-bit (8 bytes x 8 bits each).
-    fn word_xor(
-        &self,
-        mut layouter: impl Layouter<F>,
-        x: &[AssignedCell<F, F>],
-        y: &[AssignedCell<F, F>],
-    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
-        assert_eq!(x.len(), 64);
-        assert_eq!(y.len(), 64);
-        let mut bits = Vec::with_capacity(64);
-        for (x_byte, y_byte) in x.chunks(8).zip(y.chunks(8)) {
-            let mut ret = self.byte_xor(layouter.namespace(|| "byte xor"), x_byte, y_byte)?;
-            bits.append(&mut ret);
-        }
-
-        Ok(bits)
-    }
-
-    /// 64-bit modular addition: (x + y) mod 2^64.
-    ///
-    /// Carry is detected by checking byte index 8 of the field sum.
-    fn add_mod_u64(
-        &self,
-        mut layouter: impl Layouter<F>,
-        x: &AssignedCell<F, F>,
-        y: &AssignedCell<F, F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
-        layouter.assign_region(
-            || "64-bit word add",
-            |mut region| {
-                self.config.s_word_add.enable(&mut region, 0)?;
-                x.copy_advice(|| "word_add x", &mut region, self.config.advices[A0], 0)?;
-                y.copy_advice(|| "word_add y", &mut region, self.config.advices[A1], 0)?;
-                let sum = x.value().zip(y.value()).map(|(&x, &y)| {
-                    let sum = x + y;
-                    let carry = F::from(sum.to_repr().as_ref()[8] as u64);
-                    let ret = sum - carry * F::from_u128(1u128 << 64);
-                    (ret, carry)
-                });
-                let ret = region.assign_advice(
-                    || "word_add ret",
-                    self.config.advices[A0],
-                    1,
-                    || sum.map(|sum| sum.0),
-                )?;
-                region.assign_advice(
-                    || "word_add carry",
-                    self.config.advices[A1],
-                    1,
-                    || sum.map(|sum| sum.1),
-                )?;
-                Ok(ret)
-            },
-        )
-    }
-}
-
-impl<F: PrimeField> Blake2bWord<F> {
-    /// Create a `Blake2bWord` from a constant u64 value.
-    pub fn from_constant_u64(
-        value: u64,
-        layouter: &mut impl Layouter<F>,
-        chip: &Blake2bChip<F>,
-    ) -> Result<Self, Error> {
-        let mut bytes = Vec::with_capacity(8);
-        let mut word_bits = Vec::with_capacity(64);
-        let mut tmp = value;
-        for _ in 0..8 {
-            let input_byte = tmp as u8;
-            let byte = Blake2bByte::from_constant_u8(input_byte, layouter, &chip.config)?;
-            bytes.push(byte.get_byte());
-            word_bits.append(&mut byte.get_bits().to_vec());
-            tmp >>= 8;
-        }
-        let word = assign_free_constant(
-            layouter.namespace(|| "constant word"),
-            chip.config.advices[A0],
-            F::from(value),
-        )?;
-        chip.word_decompose(layouter.namespace(|| "word decompose"), &bytes, &word)?;
-        Ok(Self {
-            word,
-            bits: word_bits.try_into().unwrap(),
-        })
-    }
-
-    /// Rotate 64 bits right by the given number of positions.
-    pub fn word_rotate(bits: &[AssignedCell<F, F>], by: usize) -> Vec<AssignedCell<F, F>> {
-        assert!(bits.len() == 64);
-        let by = by % 64;
-        bits.iter()
-            .skip(by)
-            .chain(bits.iter())
-            .take(64)
-            .cloned()
-            .collect()
-    }
-
-    /// Shift 64 bits right by the given number of positions, filling with zeros.
-    pub fn shift(
-        &self,
-        by: usize,
-        mut layouter: impl Layouter<F>,
-        advice: Column<Advice>,
-    ) -> Result<Vec<AssignedCell<F, F>>, Error> {
-        let by = by % 64;
-        let padding_zero = assign_free_constant(layouter.namespace(|| "zero"), advice, F::from(0))?;
-        let old_bits = self.get_bits();
-        Ok(old_bits
-            .iter()
-            .skip(by)
-            .chain(Some(&padding_zero).into_iter().cycle())
-            .take(64)
-            .cloned()
-            .collect())
-    }
-
-    /// Get the 64 bit cells.
-    pub fn get_bits(&self) -> &[AssignedCell<F, F>; 64] {
-        &self.bits
-    }
-
-    /// Get the word value.
-    pub fn get_word(&self) -> &AssignedCell<F, F> {
-        &self.word
-    }
-
-    /// Construct from 64 assigned bit cells.
-    pub fn from_bits(
-        chip: &Blake2bChip<F>,
-        mut layouter: impl Layouter<F>,
-        bits: Vec<AssignedCell<F, F>>,
-    ) -> Result<Self, Error> {
-        assert!(bits.len() == 64);
-        let mut bytes = Vec::with_capacity(8);
-        for bits in bits.chunks(8) {
-            let byte = chip.assign_byte_from_bits(layouter.namespace(|| "byte from bits"), bits)?;
-            bytes.push(byte);
-        }
-        let word = chip.assign_word_64_from_bytes(layouter.namespace(|| "word from bytes"), &bytes)?;
-        Ok(Self {
-            word,
-            bits: bits.try_into().unwrap(),
-        })
-    }
-
-    /// Construct from an assigned 64-bit word cell by decomposing it into bytes and bits.
-    pub fn from_word(
-        chip: &Blake2bChip<F>,
-        mut layouter: impl Layouter<F>,
-        word: AssignedCell<F, F>,
-    ) -> Result<Self, Error> {
-        let mut bytes = Vec::with_capacity(8);
-        let mut bits = Vec::with_capacity(64);
-        for i in 0..8 {
-            let byte_value = word.value().map(|v| v.to_repr().as_ref()[i]);
-            let byte =
-                Blake2bByte::from_u8(byte_value, layouter.namespace(|| "from_u8"), &chip.config)?;
-            bits.append(&mut byte.get_bits().to_vec());
-            bytes.push(byte.get_byte());
-        }
-
-        chip.word_decompose(layouter.namespace(|| "word decompose"), &bytes, &word)?;
-        Ok(Self {
-            word,
-            bits: bits.try_into().unwrap(),
-        })
     }
 }

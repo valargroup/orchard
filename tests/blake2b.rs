@@ -42,135 +42,6 @@ mod compact_test_data {
     ];
 }
 
-#[derive(Default)]
-struct Blake2bTestCircuit {
-    input1: Value<pallas::Base>,
-    input2: Value<pallas::Base>,
-}
-
-impl Circuit<pallas::Base> for Blake2bTestCircuit {
-    type Config = Blake2bConfig<pallas::Base>;
-    type FloorPlanner = floor_planner::V1;
-
-    fn without_witnesses(&self) -> Self {
-        Self::default()
-    }
-
-    fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
-        let advices = [
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        ];
-
-        for advice in advices.iter() {
-            meta.enable_equality(*advice);
-        }
-
-        let constants = meta.fixed_column();
-        meta.enable_constant(constants);
-        Blake2bConfig::configure(meta, advices)
-    }
-
-    fn synthesize(
-        &self,
-        config: Self::Config,
-        mut layouter: impl Layouter<pallas::Base>,
-    ) -> Result<(), Error> {
-        let input1 = assign_free_advice(
-            layouter.namespace(|| "input1"),
-            config.advices[0],
-            self.input1,
-        )?;
-
-        let input2 = assign_free_advice(
-            layouter.namespace(|| "input2"),
-            config.advices[0],
-            self.input2,
-        )?;
-
-        let blake2b_chip = Blake2bChip::construct(config);
-        let _result =
-            blake2b_chip.process(&mut layouter, &[input1, input2], b"ZcshBlake2bTest!")?;
-
-        Ok(())
-    }
-}
-
-#[test]
-fn test_blake2b_circuit() {
-    let circuit = Blake2bTestCircuit {
-        input1: Value::known(pallas::Base::from(1u64)),
-        input2: Value::known(pallas::Base::from(2u64)),
-    };
-
-    let k = 17;
-    let prover = MockProver::run(k, &circuit, vec![]).unwrap();
-    assert_eq!(prover.verify(), Ok(()));
-}
-
-#[test]
-fn test_blake2b_empty_input() {
-    // Test with empty input (zero padding)
-    #[derive(Default)]
-    struct EmptyInputCircuit;
-
-    impl Circuit<pallas::Base> for EmptyInputCircuit {
-        type Config = Blake2bConfig<pallas::Base>;
-        type FloorPlanner = floor_planner::V1;
-
-        fn without_witnesses(&self) -> Self {
-            Self::default()
-        }
-
-        fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
-            let advices = [
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-            ];
-
-            for advice in advices.iter() {
-                meta.enable_equality(*advice);
-            }
-
-            let constants = meta.fixed_column();
-            meta.enable_constant(constants);
-            Blake2bConfig::configure(meta, advices)
-        }
-
-        fn synthesize(
-            &self,
-            config: Self::Config,
-            mut layouter: impl Layouter<pallas::Base>,
-        ) -> Result<(), Error> {
-            let blake2b_chip = Blake2bChip::construct(config);
-            let _result = blake2b_chip.process(&mut layouter, &[], b"EmptyTestBlake2b")?;
-
-            Ok(())
-        }
-    }
-
-    let circuit = EmptyInputCircuit;
-    let k = 17;
-    let prover = MockProver::run(k, &circuit, vec![]).unwrap();
-    assert_eq!(prover.verify(), Ok(()));
-}
-
 /// Reference BLAKE2b implementation for testing
 mod reference {
     use byteorder::{ByteOrder, LittleEndian};
@@ -305,7 +176,8 @@ mod reference {
     }
 }
 
-/// Test that verifies the circuit output matches a reference implementation.
+/// Test that verifies the circuit output matches a reference implementation
+/// using process_hybrid with field-only inputs (empty byte inputs).
 #[test]
 fn test_blake2b_against_reference() {
     /// Circuit that exposes hash output as public inputs for verification
@@ -381,8 +253,12 @@ fn test_blake2b_against_reference() {
             )?;
 
             let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
-            let result =
-                blake2b_chip.process(&mut layouter, &[input1, input2], &self.personalization)?;
+            let result = blake2b_chip.process_hybrid(
+                &mut layouter,
+                &[input1, input2],
+                &[],
+                &self.personalization,
+            )?;
 
             // Expose hash output words as public inputs
             for (i, word) in result.iter().enumerate() {
@@ -425,7 +301,7 @@ fn test_blake2b_against_reference() {
     );
 }
 
-/// Test with zero inputs
+/// Test with zero inputs via process_hybrid.
 #[test]
 fn test_blake2b_zeros_against_reference() {
     /// Circuit for hashing zero-filled input
@@ -499,8 +375,8 @@ fn test_blake2b_zeros_against_reference() {
             )?;
 
             let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
-            // 16-byte zero personalization
-            let result = blake2b_chip.process(&mut layouter, &[input1, input2], &[0u8; 16])?;
+            let result =
+                blake2b_chip.process_hybrid(&mut layouter, &[input1, input2], &[], &[0u8; 16])?;
 
             // Expose hash output words as public inputs
             for (i, word) in result.iter().enumerate() {

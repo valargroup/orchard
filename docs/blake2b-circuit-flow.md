@@ -169,9 +169,7 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-═══════════════════════════════════════════════════════════════════
- FIELD DECOMPOSITION — nf, cmx (16B halves, no canonicality)
-═══════════════════════════════════════════════════════════════════
+## Field Decomposition — nf, cmx (16B halves, no canonicality)
 
   Each 32B value (nf, cmx) is 256 bits, which exceeds the Pallas
   field capacity (~255 bits). So each is split into **two 16B halves**
@@ -214,9 +212,7 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-═══════════════════════════════════════════════════════════════════
- BLOCK LAYOUT — 2 actions (296B → 3 blocks)
-═══════════════════════════════════════════════════════════════════
+## Block Layout — 2 actions (296B → 3 blocks)
 
 ```
   Action 1 (148B):
@@ -243,9 +239,7 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-═══════════════════════════════════════════════════════════════════
- COMPRESSION — compress() (RFC 7693 §3.2)
-═══════════════════════════════════════════════════════════════════
+## Compression — compress() (RFC 7693 §3.2)
 
   Called once per block. For 296B input: 3 calls.
 
@@ -270,9 +264,7 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-═══════════════════════════════════════════════════════════════════
- G MIXING FUNCTION — G(v, a, b, c, d, x, y) (RFC 7693 §3.1)
-═══════════════════════════════════════════════════════════════════
+## G Mixing Function — G(v, a, b, c, d, x, y) (RFC 7693 §3.1)
 
   The atomic mixing unit. Uses Add-Rotate-XOR (ARX) at the **byte level**.
   Called 96 times per compression call.
@@ -315,9 +307,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   **Per compression call:** 96 G calls
 
 
-═══════════════════════════════════════════════════════════════════
- BLAKE2b WORD REPRESENTATION
-═══════════════════════════════════════════════════════════════════
+## BLAKE2b Word Representation
 
 ```
   pub struct Blake2bWord<F: PrimeField> {
@@ -333,9 +323,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   - Decomposition: word ↔ bytes via s_word_decompose (unchanged)
 
 
-═══════════════════════════════════════════════════════════════════
- LOOKUP TABLES
-═══════════════════════════════════════════════════════════════════
+## Lookup Tables
 
   Two lookup tables are loaded once during synthesis:
 
@@ -369,16 +357,14 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-═══════════════════════════════════════════════════════════════════
- CUSTOM GATES AND LOOKUPS
-═══════════════════════════════════════════════════════════════════
+## Custom Gates and Lookups
 
   **Gates:**
 
 ```
   Gate                Purpose                              Cost
   ─────────────────── ──────────────────────────────────── ──────────
-  s_word_decompose    word = b1 + b2*2^8 + ... + b8*2^56  1 constraint
+  s_word_decompose    word = b1 + b2*2^8 + ... + b8*2^56   1 constraint
   s_word_add          lhs + rhs = out + carry*2^64         2 constraints
   s_result_encode     field = w1 + w2*2^64                 1 constraint
   s_word_combine      w64 = w32_lo + w32_hi*2^32           1 constraint
@@ -393,5 +379,5 @@ Each action contributes 148B. For 2 actions: 296B total.
   ─────────────────── ──────────────────────────────────── ──────────
   nibble_xor_lo       (lo_a, lo_b, lo_out) in XOR table    1 lookup/byte
   nibble_xor_hi       (hi_a, hi_b, hi_out) in XOR table    1 lookup/byte
-  byte_range          val in [0, 255]                       1 lookup/byte
+  byte_range          val in [0, 255]                      1 lookup/byte
 ```

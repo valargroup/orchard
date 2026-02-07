@@ -110,6 +110,8 @@ harness = false
 
 [profile.release]
 debug = true
+lto = true
+codegen-units = 1
 
 [profile.bench]
 debug = true

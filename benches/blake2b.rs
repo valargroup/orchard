@@ -65,7 +65,7 @@ const C_ENC_PREFIX_2: [u8; 52] = [
     0x20, 0x31, 0x42, 0x53,
 ];
 
-const K: u32 = 15;
+const K: u32 = 14;
 
 /// Circuit hashing 2 compact actions via `process_compact_action_hash`.
 #[derive(Clone)]

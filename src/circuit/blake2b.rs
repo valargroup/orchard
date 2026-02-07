@@ -214,6 +214,14 @@ pub struct Blake2bConfig<F: PrimeField> {
     pub s_word_combine: Selector,
     /// Selector for 1-bit left shift gate (used for R4=63 rotation).
     pub s_left_shift_1: Selector,
+    /// Selector for fused add-and-decompose gate: lhs + rhs = bytes + carry*2^64.
+    pub s_fused_add_decompose: Selector,
+    /// Selector for single-row word addition: lhs + rhs = result + carry*2^64.
+    pub s_word_add_single: Selector,
+    /// Selector for fused pack-add-decompose: pack input bytes + other_word = result bytes + carry*2^64.
+    pub s_pack_add_decompose: Selector,
+    /// Selector for fused pack-and-add: pack input bytes + other_word = result + carry*2^64.
+    pub s_pack_add: Selector,
     /// Complex selector for nibble XOR lookup (two 3-column lookups + decompose gate).
     q_nibble_xor: Selector,
     /// Complex selector for 8-byte range check lookup (checks A0..A7 against [0,255]).
@@ -270,6 +278,10 @@ impl<F: PrimeField> Blake2bConfig<F> {
         let s_field_recompose = meta.selector();
         let s_word_combine = meta.selector();
         let s_left_shift_1 = meta.selector();
+        let s_fused_add_decompose = meta.selector();
+        let s_word_add_single = meta.selector();
+        let s_pack_add_decompose = meta.selector();
+        let s_pack_add = meta.selector();
 
         // Complex selectors for use in lookup expressions
         let q_nibble_xor = meta.complex_selector();
@@ -387,6 +399,121 @@ impl<F: PrimeField> Blake2bConfig<F> {
             Constraints::with_selector(s, constraints)
         });
 
+        // Fused add-and-decompose gate:
+        // Row 0: A0-A7 = result bytes, A8 = lhs, A9 = rhs
+        // Row 1: A0 = carry, A1 = result_word
+        // Constraints:
+        //   lhs + rhs = result_word + carry * 2^64
+        //   result_word = byte[0] + byte[1]*256 + ... + byte[7]*2^56
+        //   bool_check(carry)
+        // q_range_check_8 is enabled on row 0 externally (in the method).
+        meta.create_gate("fused add and decompose", |meta| {
+            let s = meta.query_selector(s_fused_add_decompose);
+            let lhs = meta.query_advice(advices[A8], Rotation::cur());
+            let rhs = meta.query_advice(advices[A9], Rotation::cur());
+            let carry = meta.query_advice(advices[A0], Rotation::next());
+            let result_word = meta.query_advice(advices[A1], Rotation::next());
+
+            let mut byte_sum = meta.query_advice(advices[A0], Rotation::cur());
+            for i in 1..8usize {
+                byte_sum = byte_sum
+                    + meta.query_advice(advices[i], Rotation::cur()) * F::from(1u64 << (8 * i));
+            }
+
+            Constraints::with_selector(
+                s,
+                [
+                    ("addition", lhs + rhs - result_word.clone() - carry.clone() * F::from_u128(1u128 << 64)),
+                    ("decompose", result_word - byte_sum),
+                    ("carry bool", bool_check(carry)),
+                ],
+            )
+        });
+
+        // Single-row word addition gate:
+        // Row 0: A0 = lhs, A1 = rhs, A2 = result, A3 = carry
+        // Constraint: lhs + rhs = result + carry * 2^64, bool_check(carry)
+        meta.create_gate("single-row word add", |meta| {
+            let s = meta.query_selector(s_word_add_single);
+            let lhs = meta.query_advice(advices[A0], Rotation::cur());
+            let rhs = meta.query_advice(advices[A1], Rotation::cur());
+            let result = meta.query_advice(advices[A2], Rotation::cur());
+            let carry = meta.query_advice(advices[A3], Rotation::cur());
+
+            Constraints::with_selector(
+                s,
+                [
+                    ("add", lhs + rhs - result - carry.clone() * F::from_u128(1u128 << 64)),
+                    ("carry bool", bool_check(carry)),
+                ],
+            )
+        });
+
+        // Fused pack-add-decompose gate:
+        // Row 0: A0-A7 = input bytes (from XOR rotation), A8 = other_word, A9 = carry
+        // Row 1: A0-A7 = result bytes, A8 = result_word
+        // Constraints:
+        //   other_word + pack(input_bytes) = result_word + carry * 2^64
+        //   result_word = pack(result_bytes)
+        //   bool_check(carry)
+        // q_range_check_8 on row 1 (for result bytes) — enabled externally.
+        meta.create_gate("fused pack-add-decompose", |meta| {
+            let s = meta.query_selector(s_pack_add_decompose);
+
+            let other_word = meta.query_advice(advices[A8], Rotation::cur());
+            let carry = meta.query_advice(advices[A9], Rotation::cur());
+            let result_word = meta.query_advice(advices[A8], Rotation::next());
+
+            let mut input_sum = meta.query_advice(advices[A0], Rotation::cur());
+            for i in 1..8usize {
+                input_sum = input_sum
+                    + meta.query_advice(advices[i], Rotation::cur()) * F::from(1u64 << (8 * i));
+            }
+
+            let mut result_sum = meta.query_advice(advices[A0], Rotation::next());
+            for i in 1..8usize {
+                result_sum = result_sum
+                    + meta.query_advice(advices[i], Rotation::next()) * F::from(1u64 << (8 * i));
+            }
+
+            Constraints::with_selector(
+                s,
+                [
+                    ("pack-add", other_word + input_sum - result_word.clone() - carry.clone() * F::from_u128(1u128 << 64)),
+                    ("decompose", result_word - result_sum),
+                    ("carry bool", bool_check(carry)),
+                ],
+            )
+        });
+
+        // Fused pack-and-add gate:
+        // Row 0: A0-A7 = input bytes, A8 = other_word
+        // Row 1: A0 = result, A1 = carry
+        // Constraints:
+        //   pack(input_bytes) + other_word = result + carry * 2^64
+        //   bool_check(carry)
+        meta.create_gate("fused pack-and-add", |meta| {
+            let s = meta.query_selector(s_pack_add);
+
+            let other_word = meta.query_advice(advices[A8], Rotation::cur());
+            let result = meta.query_advice(advices[A0], Rotation::next());
+            let carry = meta.query_advice(advices[A1], Rotation::next());
+
+            let mut input_sum = meta.query_advice(advices[A0], Rotation::cur());
+            for i in 1..8usize {
+                input_sum = input_sum
+                    + meta.query_advice(advices[i], Rotation::cur()) * F::from(1u64 << (8 * i));
+            }
+
+            Constraints::with_selector(
+                s,
+                [
+                    ("pack-add", input_sum + other_word - result - carry.clone() * F::from_u128(1u128 << 64)),
+                    ("carry bool", bool_check(carry)),
+                ],
+            )
+        });
+
         // Nibble XOR: decompose/recompose gate
         // Row layout: A0=byte_a, A1=byte_b, A2=lo_a, A3=hi_a, A4=lo_b, A5=hi_b,
         //             A6=lo_out, A7=hi_out, A8=out_byte
@@ -452,6 +579,10 @@ impl<F: PrimeField> Blake2bConfig<F> {
             s_field_recompose,
             s_word_combine,
             s_left_shift_1,
+            s_fused_add_decompose,
+            s_word_add_single,
+            s_pack_add_decompose,
+            s_pack_add,
             q_nibble_xor,
             q_range_check_8,
             xor_table_lhs,
@@ -874,6 +1005,265 @@ impl<F: PrimeField> Blake2bChip<F> {
                     || sum.map(|sum| sum.1),
                 )?;
                 Ok(ret)
+            },
+        )
+    }
+
+    /// Fused add-and-decompose: computes (lhs + rhs) mod 2^64 and decomposes into bytes.
+    ///
+    /// Row 0: A0-A7 = result bytes, A8 = lhs, A9 = rhs
+    /// Row 1: A0 = carry, A1 = result_word
+    /// Enables s_fused_add_decompose and q_range_check_8 on row 0.
+    /// Single 2-row region produces both word and bytes.
+    fn fused_add_decompose(
+        &self,
+        mut layouter: impl Layouter<F>,
+        lhs: &AssignedCell<F, F>,
+        rhs: &AssignedCell<F, F>,
+    ) -> Result<Blake2bWord<F>, Error> {
+        layouter.assign_region(
+            || "fused add-decompose",
+            |mut region| {
+                self.config.s_fused_add_decompose.enable(&mut region, 0)?;
+                self.config.q_range_check_8.enable(&mut region, 0)?;
+
+                // Copy lhs and rhs
+                lhs.copy_advice(|| "lhs", &mut region, self.config.advices[A8], 0)?;
+                rhs.copy_advice(|| "rhs", &mut region, self.config.advices[A9], 0)?;
+
+                // Compute result
+                let sum_val = lhs.value().zip(rhs.value()).map(|(&l, &r)| {
+                    let s = l + r;
+                    let repr = s.to_repr();
+                    let bytes_raw = repr.as_ref();
+                    let carry = bytes_raw[8] as u64;
+                    let mut result_bytes = [0u8; 8];
+                    result_bytes.copy_from_slice(&bytes_raw[..8]);
+                    let result_word = s - F::from(carry) * F::from_u128(1u128 << 64);
+                    (result_bytes, result_word, carry)
+                });
+
+                // Assign bytes on row 0
+                let mut bytes = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let byte = region.assign_advice(
+                        || format!("byte_{}", i),
+                        self.config.advices[i],
+                        0,
+                        || sum_val.map(|(b, _, _)| F::from(b[i] as u64)),
+                    )?;
+                    bytes.push(byte);
+                }
+
+                // Assign carry on row 1, A0
+                region.assign_advice(
+                    || "carry",
+                    self.config.advices[A0],
+                    1,
+                    || sum_val.map(|(_, _, c)| F::from(c)),
+                )?;
+
+                // Assign result_word on row 1, A1
+                let word = region.assign_advice(
+                    || "result_word",
+                    self.config.advices[A1],
+                    1,
+                    || sum_val.map(|(_, w, _)| w),
+                )?;
+
+                Ok(Blake2bWord {
+                    word,
+                    bytes: bytes.try_into().unwrap(),
+                })
+            },
+        )
+    }
+
+    /// Single-row 64-bit modular addition: (lhs + rhs) mod 2^64.
+    ///
+    /// Row 0: A0 = lhs, A1 = rhs, A2 = result, A3 = carry
+    fn single_row_add(
+        &self,
+        mut layouter: impl Layouter<F>,
+        lhs: &AssignedCell<F, F>,
+        rhs: &AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        layouter.assign_region(
+            || "single-row word add",
+            |mut region| {
+                self.config.s_word_add_single.enable(&mut region, 0)?;
+
+                lhs.copy_advice(|| "lhs", &mut region, self.config.advices[A0], 0)?;
+                rhs.copy_advice(|| "rhs", &mut region, self.config.advices[A1], 0)?;
+
+                let sum = lhs.value().zip(rhs.value()).map(|(&x, &y)| {
+                    let s = x + y;
+                    let carry = F::from(s.to_repr().as_ref()[8] as u64);
+                    let ret = s - carry * F::from_u128(1u128 << 64);
+                    (ret, carry)
+                });
+
+                let ret = region.assign_advice(
+                    || "result",
+                    self.config.advices[A2],
+                    0,
+                    || sum.map(|s| s.0),
+                )?;
+                region.assign_advice(
+                    || "carry",
+                    self.config.advices[A3],
+                    0,
+                    || sum.map(|s| s.1),
+                )?;
+
+                Ok(ret)
+            },
+        )
+    }
+
+    /// Fused pack-add-decompose: packs input bytes into a word, adds other_word,
+    /// and decomposes the result into bytes.
+    ///
+    /// Row 0: A0-A7 = input bytes, A8 = other_word, A9 = carry
+    /// Row 1: A0-A7 = result bytes, A8 = result_word
+    /// Enables q_range_check_8 on row 1 (result bytes need range check).
+    fn pack_add_decompose(
+        &self,
+        mut layouter: impl Layouter<F>,
+        input_bytes: &[AssignedCell<F, F>; 8],
+        other_word: &AssignedCell<F, F>,
+    ) -> Result<Blake2bWord<F>, Error> {
+        layouter.assign_region(
+            || "fused pack-add-decompose",
+            |mut region| {
+                self.config.s_pack_add_decompose.enable(&mut region, 0)?;
+                self.config.q_range_check_8.enable(&mut region, 1)?;
+
+                // Row 0: input bytes + other_word + carry
+                for (i, byte) in input_bytes.iter().enumerate() {
+                    byte.copy_advice(
+                        || format!("in_byte_{}", i),
+                        &mut region,
+                        self.config.advices[i],
+                        0,
+                    )?;
+                }
+                other_word.copy_advice(
+                    || "other_word",
+                    &mut region,
+                    self.config.advices[A8],
+                    0,
+                )?;
+
+                // Compute: input_packed + other_word
+                let input_packed = word_value_from_bytes(input_bytes);
+                let sum_val = input_packed
+                    .zip(other_word.value().copied())
+                    .map(|(inp, ow)| {
+                        let s = inp + ow;
+                        let repr = s.to_repr();
+                        let bytes_raw = repr.as_ref();
+                        let carry = bytes_raw[8] as u64;
+                        let mut result_bytes = [0u8; 8];
+                        result_bytes.copy_from_slice(&bytes_raw[..8]);
+                        let result_word = s - F::from(carry) * F::from_u128(1u128 << 64);
+                        (result_bytes, result_word, carry)
+                    });
+
+                // Assign carry on row 0
+                region.assign_advice(
+                    || "carry",
+                    self.config.advices[A9],
+                    0,
+                    || sum_val.map(|(_, _, c)| F::from(c)),
+                )?;
+
+                // Row 1: result bytes + result_word
+                let mut result_bytes_cells = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let byte = region.assign_advice(
+                        || format!("res_byte_{}", i),
+                        self.config.advices[i],
+                        1,
+                        || sum_val.map(|(b, _, _)| F::from(b[i] as u64)),
+                    )?;
+                    result_bytes_cells.push(byte);
+                }
+                let result_word = region.assign_advice(
+                    || "result_word",
+                    self.config.advices[A8],
+                    1,
+                    || sum_val.map(|(_, w, _)| w),
+                )?;
+
+                let bytes: [AssignedCell<F, F>; 8] =
+                    result_bytes_cells.try_into().unwrap();
+                Ok(Blake2bWord {
+                    word: result_word,
+                    bytes,
+                })
+            },
+        )
+    }
+
+    /// Fused pack-and-add: packs input bytes into a word and adds other_word.
+    /// Returns only the word result (no byte decomposition).
+    ///
+    /// Row 0: A0-A7 = input bytes, A8 = other_word
+    /// Row 1: A0 = result, A1 = carry
+    fn pack_add(
+        &self,
+        mut layouter: impl Layouter<F>,
+        input_bytes: &[AssignedCell<F, F>; 8],
+        other_word: &AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        layouter.assign_region(
+            || "fused pack-and-add",
+            |mut region| {
+                self.config.s_pack_add.enable(&mut region, 0)?;
+
+                // Row 0: input bytes + other_word
+                for (i, byte) in input_bytes.iter().enumerate() {
+                    byte.copy_advice(
+                        || format!("in_byte_{}", i),
+                        &mut region,
+                        self.config.advices[i],
+                        0,
+                    )?;
+                }
+                other_word.copy_advice(
+                    || "other_word",
+                    &mut region,
+                    self.config.advices[A8],
+                    0,
+                )?;
+
+                // Compute: input_packed + other_word
+                let input_packed = word_value_from_bytes(input_bytes);
+                let sum_val = input_packed
+                    .zip(other_word.value().copied())
+                    .map(|(inp, ow)| {
+                        let s = inp + ow;
+                        let carry = F::from(s.to_repr().as_ref()[8] as u64);
+                        let ret = s - carry * F::from_u128(1u128 << 64);
+                        (ret, carry)
+                    });
+
+                // Row 1: result + carry
+                let result = region.assign_advice(
+                    || "result",
+                    self.config.advices[A0],
+                    1,
+                    || sum_val.map(|(r, _)| r),
+                )?;
+                region.assign_advice(
+                    || "carry",
+                    self.config.advices[A1],
+                    1,
+                    || sum_val.map(|(_, c)| c),
+                )?;
+
+                Ok(result)
             },
         )
     }
@@ -1396,6 +1786,22 @@ impl<F: PrimeField> Blake2bChip<F> {
     /// The G primitive function mixes two input words, "x" and "y", into
     /// four words indexed by "a", "b", "c", and "d" in the working vector
     /// v[0..15].
+    ///
+    /// Optimized to 50 rows (down from 63) using fused gates:
+    ///   1. single_row_add(v[a], v[b])             — 1 row
+    ///   2. fused_add_decompose(sum, x)             — 2 rows
+    ///   3. word_xor(v[d], v[a]) + rotate R1        — 8 rows
+    ///   4. pack_add_decompose(d_bytes, v[c])       — 2 rows
+    ///   5. word_xor(v[b], v[c]) + rotate R2        — 8 rows
+    ///   6. pack_add(b_bytes, v[a])                  — 2 rows
+    ///   7. fused_add_decompose(sum, y)             — 2 rows
+    ///   8. word_xor(d_bytes, v[a]) + rotate R3     — 8 rows
+    ///   9. pack_add_decompose(d_bytes2, v[c])      — 2 rows
+    ///  10. word_xor(b_bytes, v[c])                  — 8 rows
+    ///  11. left_rotate_1 (R4=63)                   — 3 rows
+    ///  12. from_bytes_unchecked (v[b])              — 2 rows
+    ///  13. from_bytes_unchecked (v[d])              — 2 rows
+    ///                                        Total: 50 rows
     fn g(
         &self,
         mut layouter: impl Layouter<F>,
@@ -1404,100 +1810,73 @@ impl<F: PrimeField> Blake2bChip<F> {
         x: &Blake2bWord<F>,
         y: &Blake2bWord<F>,
     ) -> Result<(), Error> {
-        // v[a] := (v[a] + v[b] + x) mod 2**w
+        // Step 1+2: v[a] := (v[a] + v[b] + x) mod 2**w
         v[a] = {
-            let sum_a_b = self.add_mod_u64(
+            let sum_a_b = self.single_row_add(
                 layouter.namespace(|| "g/add_ab"),
                 v[a].get_word(),
                 v[b].get_word(),
             )?;
-            let sum_a_b_x =
-                self.add_mod_u64(layouter.namespace(|| "g/add_ab_x"), &sum_a_b, x.get_word())?;
-            Blake2bWord::from_word(self, layouter.namespace(|| "g/word_from_sum_1"), sum_a_b_x)?
-        };
-
-        // v[d] := (v[d] ^ v[a]) >>> R1 (32 = 4 bytes)
-        v[d] = {
-            let xor_bytes = self.word_xor(
-                layouter.namespace(|| "g/xor_da"),
-                v[d].get_bytes(),
-                v[a].get_bytes(),
-            )?;
-            let rotated = Blake2bWord::byte_rotate(&xor_bytes, R1);
-            Blake2bWord::from_bytes_unchecked(
-                self,
-                layouter.namespace(|| "g/rot_r1"),
-                rotated,
+            self.fused_add_decompose(
+                layouter.namespace(|| "g/fad_x"),
+                &sum_a_b,
+                x.get_word(),
             )?
         };
 
-        // v[c] := (v[c] + v[d]) mod 2**w
-        v[c] = {
-            let sum = self.add_mod_u64(
-                layouter.namespace(|| "g/add_cd"),
-                v[c].get_word(),
-                v[d].get_word(),
-            )?;
-            Blake2bWord::from_word(self, layouter.namespace(|| "g/word_from_sum_2"), sum)?
-        };
+        // Step 3+4: v[d] := (v[d] ^ v[a]) >>> R1, v[c] := (v[c] + v[d]) mod 2**w
+        // Keep d_bytes as local — v[d] word not needed until exit.
+        let xor_da = self.word_xor(
+            layouter.namespace(|| "g/xor_da"),
+            v[d].get_bytes(),
+            v[a].get_bytes(),
+        )?;
+        let d_bytes = Blake2bWord::byte_rotate(&xor_da, R1);
+        v[c] = self.pack_add_decompose(
+            layouter.namespace(|| "g/pad_cd"),
+            &d_bytes,
+            v[c].get_word(),
+        )?;
 
-        // v[b] := (v[b] ^ v[c]) >>> R2 (24 = 3 bytes)
-        v[b] = {
-            let xor_bytes = self.word_xor(
-                layouter.namespace(|| "g/xor_bc"),
-                v[b].get_bytes(),
-                v[c].get_bytes(),
-            )?;
-            let rotated = Blake2bWord::byte_rotate(&xor_bytes, R2);
-            Blake2bWord::from_bytes_unchecked(
-                self,
-                layouter.namespace(|| "g/rot_r2"),
-                rotated,
-            )?
-        };
+        // Step 5+6: v[b] := (v[b] ^ v[c]) >>> R2, intermediate sum for v[a]
+        // Keep b_bytes as local — v[b] word not needed until exit.
+        let xor_bc = self.word_xor(
+            layouter.namespace(|| "g/xor_bc"),
+            v[b].get_bytes(),
+            v[c].get_bytes(),
+        )?;
+        let b_bytes = Blake2bWord::byte_rotate(&xor_bc, R2);
+        let sum_ab2 = self.pack_add(
+            layouter.namespace(|| "g/pa_ab2"),
+            &b_bytes,
+            v[a].get_word(),
+        )?;
 
-        // v[a] := (v[a] + v[b] + y) mod 2**w
-        v[a] = {
-            let sum_a_b = self.add_mod_u64(
-                layouter.namespace(|| "g/add_ab_2"),
-                v[a].get_word(),
-                v[b].get_word(),
-            )?;
-            let sum_a_b_y =
-                self.add_mod_u64(layouter.namespace(|| "g/add_ab_y"), &sum_a_b, y.get_word())?;
-            Blake2bWord::from_word(self, layouter.namespace(|| "g/word_from_sum_3"), sum_a_b_y)?
-        };
+        // Step 7: v[a] := (v[a] + v[b] + y) mod 2**w
+        v[a] = self.fused_add_decompose(
+            layouter.namespace(|| "g/fad_y"),
+            &sum_ab2,
+            y.get_word(),
+        )?;
 
-        // v[d] := (v[d] ^ v[a]) >>> R3 (16 = 2 bytes)
-        v[d] = {
-            let xor_bytes = self.word_xor(
-                layouter.namespace(|| "g/xor_da_2"),
-                v[d].get_bytes(),
-                v[a].get_bytes(),
-            )?;
-            let rotated = Blake2bWord::byte_rotate(&xor_bytes, R3);
-            Blake2bWord::from_bytes_unchecked(
-                self,
-                layouter.namespace(|| "g/rot_r3"),
-                rotated,
-            )?
-        };
+        // Step 8+9: v[d] := (v[d] ^ v[a]) >>> R3, v[c] := (v[c] + v[d]) mod 2**w
+        let xor_da2 = self.word_xor(
+            layouter.namespace(|| "g/xor_da_2"),
+            &d_bytes,
+            v[a].get_bytes(),
+        )?;
+        let d_bytes2 = Blake2bWord::byte_rotate(&xor_da2, R3);
+        v[c] = self.pack_add_decompose(
+            layouter.namespace(|| "g/pad_cd2"),
+            &d_bytes2,
+            v[c].get_word(),
+        )?;
 
-        // v[c] := (v[c] + v[d]) mod 2**w
-        v[c] = {
-            let sum = self.add_mod_u64(
-                layouter.namespace(|| "g/add_cd_2"),
-                v[c].get_word(),
-                v[d].get_word(),
-            )?;
-            Blake2bWord::from_word(self, layouter.namespace(|| "g/word_from_sum_4"), sum)?
-        };
-
-        // v[b] := (v[b] ^ v[c]) >>> R4 (63 = left-rotate 1)
+        // Step 10+11+12: v[b] := (v[b] ^ v[c]) >>> R4 (63 = left-rotate 1)
         v[b] = {
             let xor_bytes = self.word_xor(
                 layouter.namespace(|| "g/xor_bc_2"),
-                v[b].get_bytes(),
+                &b_bytes,
                 v[c].get_bytes(),
             )?;
             let shifted = self.left_rotate_1(
@@ -1510,6 +1889,13 @@ impl<F: PrimeField> Blake2bChip<F> {
                 shifted,
             )?
         };
+
+        // Step 13: Pack v[d] final bytes (needed for next round's word operations)
+        v[d] = Blake2bWord::from_bytes_unchecked(
+            self,
+            layouter.namespace(|| "g/pack_d"),
+            d_bytes2,
+        )?;
 
         Ok(())
     }

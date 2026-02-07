@@ -123,7 +123,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   │  compress(h, block2, t=256, f=false)                     │
   │  compress(h, block3, t=296, f=true)                      │
   │                                                          │
-  │  288 G calls × ~63 rows/G ≈ 18,500 rows (dominant)       │
+  │  288 G calls × ~50 rows/G ≈ 14,400 rows (dominant)       │
   └──────────────────────────┬───────────────────────────────┘
                              │
                              ▼
@@ -251,18 +251,30 @@ Each action contributes 148B. For 2 actions: 296B total.
 
   All arithmetic is mod 2^64. Rotations are right-rotations.
 
+  Uses fused gates to minimize row count (50 rows per G, down from 63):
+
 ```
-  ┌──────────────────────────────────────────────────────────┐
-  │ v[a] = v[a] + v[b] + x          [s_word_add x 2]         │
-  │ v[d] = (v[d] XOR v[a]) >>> 32   byte shuffle [4..7,0..3] │
-  │ v[c] = v[c] + v[d]              [s_word_add]             │
-  │ v[b] = (v[b] XOR v[c]) >>> 24   byte shuffle [3..7,0..2] │
-  │ v[a] = v[a] + v[b] + y          [s_word_add x 2]         │
-  │ v[d] = (v[d] XOR v[a]) >>> 16   byte shuffle [2..7,0..1] │
-  │ v[c] = v[c] + v[d]              [s_word_add]             │
-  │ v[b] = (v[b] XOR v[c]) >>> 63   [s_left_shift_1] gate    │
-  └──────────────────────────────────────────────────────────┘
+  Step  Operation                                    Gate(s)               Rows
+  ───── ──────────────────────────────────────────── ───────────────────── ────
+   1    v[a]+v[b]                                    s_word_add_single      1
+   2    sum+x → v[a] (word+bytes)                    s_fused_add_decompose  2
+   3    (v[d] XOR v[a]) >>> 32                       q_nibble_xor × 8       8
+   4    pack(d_bytes)+v[c] → v[c] (word+bytes)       s_pack_add_decompose   2
+   5    (v[b] XOR v[c]) >>> 24                       q_nibble_xor × 8       8
+   6    pack(b_bytes)+v[a] → intermediate sum        s_pack_add             2
+   7    sum+y → v[a] (word+bytes)                    s_fused_add_decompose  2
+   8    (d_bytes XOR v[a]) >>> 16                    q_nibble_xor × 8       8
+   9    pack(d_bytes2)+v[c] → v[c] (word+bytes)      s_pack_add_decompose   2
+  10    (b_bytes XOR v[c])                           q_nibble_xor × 8       8
+  11    left-rotate 1 bit (R4=63)                    s_left_shift_1         3
+  12    pack shifted → v[b] (word+bytes)             s_word_decompose       2
+  13    pack d_bytes2 → v[d] (word+bytes)            s_word_decompose       2
+                                                                     Total: 50
 ```
+
+  **Key optimization:** Intermediate v[d] and v[b] byte arrays from XOR
+  rotations are kept as local variables (not packed into Blake2bWord) until
+  needed, saving 4 rows per G. Only the final v[d] and v[b] are packed.
 
   **XOR:** Each byte XOR splits both input bytes into nibbles, performs
   two 4-bit XOR lookups (lo and hi), and recombines. 1 row per byte XOR,
@@ -278,11 +290,14 @@ Each action contributes 148B. For 2 actions: 296B total.
     3 constraints per byte × 8 bytes = **24 constraints** per R4 rotation.
 
   **Per G call:**
-  - 6 additions (s_word_add)
+  - 2 fused add-decompose (s_fused_add_decompose)
+  - 1 single-row add (s_word_add_single)
+  - 2 pack-add-decompose (s_pack_add_decompose)
+  - 1 pack-add (s_pack_add)
   - 4 XOR operations (8 byte lookups each = 32 lookups)
   - 3 free byte shuffles (R1, R2, R3)
   - 1 left-shift-1 (R4, 24 constraints)
-  - 4 word reconstructions from bytes (s_word_decompose)
+  - 2 byte-to-word packs (s_word_decompose)
 
   **Per compression call:** 96 G calls
 
@@ -312,7 +327,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   Instead of a full byte XOR table (256 × 256 = 65,536 rows, requiring
   K≥17), each byte is split into two 4-bit nibbles (lo and hi), and two
   smaller lookups are performed against a single 16 × 16 = 256-row table.
-  This enables K=15 (4x smaller circuit).
+  This enables K=14 (8x smaller than K=17).
 
   **Worked example** — `0xA7 XOR 0x3B`:
 ```
@@ -345,15 +360,19 @@ Each action contributes 148B. For 2 actions: 296B total.
   **Gates:**
 
 ```
-  Gate                Purpose                              Cost
-  ─────────────────── ──────────────────────────────────── ──────────
-  s_word_decompose    word = b1 + b2*2^8 + ... + b8*2^56   1 constraint
-  s_word_add          lhs + rhs = out + carry*2^64         2 constraints
-  s_result_encode     field = w1 + w2*2^64                 1 constraint
-  s_field_recompose   field = sum_01 + sum_23*2^128        1 constraint
-  s_word_combine      w64 = w32_lo + w32_hi*2^32           1 constraint
-  s_left_shift_1      2*in + c_in = out + 256*c_out        3 constraints/byte
-  q_nibble_xor        byte = lo + hi*16 (decompose)        3 constraints
+  Gate                    Purpose                                   Cost
+  ─────────────────────── ───────────────────────────────────────── ──────────
+  s_word_decompose        word = b1 + b2*2^8 + ... + b8*2^56        1 constraint
+  s_word_add              lhs + rhs = out + carry*2^64              2 constraints
+  s_fused_add_decompose   lhs + rhs = word = bytes + carry*2^64     3 constraints
+  s_word_add_single       lhs + rhs = result + carry*2^64 (1 row)   2 constraints
+  s_pack_add_decompose    pack(in) + other = word = bytes + c*2^64  3 constraints
+  s_pack_add              pack(in) + other = result + carry*2^64    2 constraints
+  s_result_encode         field = w1 + w2*2^64                      1 constraint
+  s_field_recompose       field = sum_01 + sum_23*2^128             1 constraint
+  s_word_combine          w64 = w32_lo + w32_hi*2^32                1 constraint
+  s_left_shift_1          2*in + c_in = out + 256*c_out             3 constraints/byte
+  q_nibble_xor            byte = lo + hi*16 (decompose)             3 constraints
 ```
 
   **Lookups:**

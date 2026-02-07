@@ -413,7 +413,7 @@ fn test_two_action_against_reference() {
 
     let circuit = build_circuit(&a1, &a2, personalization);
 
-    let k = 15;
+    let k = 14;
     let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
     assert_eq!(
         prover.verify(),
@@ -432,7 +432,7 @@ fn test_two_action_zeros() {
     let expected_words = expected_hash_from_blake2b_simd(&a1, &a2, personalization);
     let circuit = build_circuit(&a1, &a2, personalization);
 
-    let k = 15;
+    let k = 14;
     let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
     assert_eq!(prover.verify(), Ok(()), "Two-action zeros test failed");
 }
@@ -452,7 +452,7 @@ fn test_two_action_compact_hash() {
     let expected_words = expected_hash_from_blake2b_simd(&a1, &a2, personalization);
     let circuit = build_circuit(&a1, &a2, personalization);
 
-    let k = 15;
+    let k = 14;
     let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
     assert_eq!(
         prover.verify(),

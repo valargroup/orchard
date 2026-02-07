@@ -258,7 +258,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   │    Total: 12 × 8 = 96 G invocations per compress call      │
   ├────────────────────────────────────────────────────────────┤
   │ 3. Finalize:                                               │
-  │    h[i] = h[i] XOR v[i] XOR v[i+8]   for i = 0..7         │
+  │    h[i] = h[i] XOR v[i] XOR v[i+8]   for i = 0..7          │
   │    (two byte-level word_xor + word reconstruction)         │
   └────────────────────────────────────────────────────────────┘
 ```

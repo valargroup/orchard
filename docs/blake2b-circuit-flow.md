@@ -4,11 +4,18 @@
 
 Prove knowledge of nullifiers such that
 
-    BLAKE2b-256("ZTxIdOrcActCHash", action_1 || action_2) = action_hash
+```
+BLAKE2b-256("ZTxIdOrcActCHash", action_1 || action_2) = action_hash
+```
 
-where each action = nf || cmx || epk || enc[0..52] (148B), without
-revealing the nullifiers. The circuit always hashes exactly **2 actions**
-(296B total), matching ZIP-244's `hashOrchardActions`.
+where each action is:
+
+```
+action = nf || cmx || epk || enc[0..52]   (148B)
+```
+
+without revealing the nullifiers. The circuit always hashes exactly
+**2 actions** (296B total), matching ZIP-244's `hashOrchardActions`.
 
 
 ## Terminology

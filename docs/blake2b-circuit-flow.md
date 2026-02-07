@@ -366,3 +366,20 @@ Each action contributes 148B. For 2 actions: 296B total.
                       once for hi nibbles
   byte_range          val in [0, 255]                      1 lookup/byte
 ```
+
+
+## Why epk/enc Range Checks Are In-Circuit
+
+  The epk (32B) and enc_prefix (52B) bytes are advice (witness) cells,
+  not instance column values. Without in-circuit range checks, the
+  word decomposition gate `word = b0 + b1·256 + ... + b7·256^7` has
+  multiple solutions in field arithmetic — e.g. b0=300, b1=x produces
+  the same word as b0=44, b1=x+1. A prover could feed arbitrary field
+  elements as "bytes" and the circuit would hash a non-byte message.
+
+  An alternative is to promote epk/enc to instance columns and have
+  the verifier reject any value >= 256 externally. This would remove
+  ~22 rows of in-circuit lookups per action, but add 84 instance
+  bindings per action (168 total) — far more expensive than the
+  current 2 instance values (the hash output). The in-circuit range
+  checks are the better tradeoff.

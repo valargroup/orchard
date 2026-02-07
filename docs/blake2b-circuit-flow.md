@@ -33,7 +33,7 @@ without revealing the nullifiers. The circuit always hashes exactly
   > using lookup tables, eliminating the need for bit-level cells.
 
 
-## Circuit Inputs (2 actions)
+## Circuit Inputs
 
 Each action contributes 148B. For 2 actions: 296B total.
 
@@ -61,69 +61,74 @@ Each action contributes 148B. For 2 actions: 296B total.
   > Packed by `encode_result()` and exposed as public inputs via
   > `constrain_instance()`.
 
+### Precomputed block 1
+
+When the first action is entirely public (e.g., a governance delegate action),
+block 1 contains only public data. The verifier precomputes
+`h_1 = compress(h_init, block1, 128, false)` outside the circuit and passes it
+as a public input. The circuit starts from h_1 and processes only blocks 2
+and 3, saving ~4,800 rows and reducing K from 14 to 13.
+
+### Instance layout (10 values)
+
+```
+  instance[0..8]:  h_1 as 8 raw u64 words (each a field element)
+  instance[8..10]: hash output as 2 × 128-bit packed fields
+```
+
+
+## Circuit Flow
+
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
-║                         CIRCUIT INPUTS (2 ACTIONS)                   ║
+║                         CIRCUIT INPUTS                               ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  PRIVATE (auxiliary witness)         PUBLIC INPUTS                   ║
-║  ┌───────────────────────────┐      ┌──────────────────────────┐     ║
-║  │ Action 1:                 │      │ Action 1:                │     ║
-║  │   nf_1 (Fp)               │      │   cmx_1 (Fp)             │     ║
-║  │                           │      │   epk_1  (32B)           │     ║
-║  ├───────────────────────────┤      │   enc_1  (52B)           │     ║
-║  │ Action 2:                 │      ├──────────────────────────┤     ║
-║  │   nf_2 (Fp)               │      │ Action 2:                │     ║
-║  └───────────┬───────────────┘      │   cmx_2 (Fp)             │     ║
-║              │                      │   epk_2  (32B)           │     ║
-║              │                      │   enc_2  (52B)           │     ║
-║              │                      ├──────────────────────────┤     ║
-║              │                      │ expected action_hash     │     ║
-║              │                      │ 2 field elements         │     ║
-║              │                      └────────┬─────────────────┘     ║
-╚══════════════╪═══════════════════════════════╪═══════════════════════╝
-               │                               │
-               ▼                               ▼
+║  WITNESS (advice)               PUBLIC INPUTS (instance)             ║
+║  ┌────────────────────┐        ┌─────────────────────────────┐       ║
+║  │ nf_2 (Fp)          │        │ h_1[0..8]  (8 u64 words)    │       ║
+║  │ enc_1_tail  (20B)  │        │   = compress(h_init, block1) │       ║
+║  │ cmx_2 (Fp)         │        ├─────────────────────────────┤       ║
+║  │ epk_2 (32B)        │        │ expected action_hash         │       ║
+║  │ enc_2 (52B)        │        │   2 field elements           │       ║
+║  └────────┬───────────┘        └──────────┬──────────────────┘       ║
+╚═══════════╪═══════════════════════════════╪══════════════════════════╝
+            │                               │
+            ▼                               ▼
 ╔══════════════════════════════════════════════════════════════════════╗
-║  process_compact_action_hash(action_1, action_2)                     ║
+║  process_precomputed_action_hash(h_1, enc_1_tail, action_2)          ║
 ╚════════════════════════════════╤═════════════════════════════════════╝
                                  │
-              ┌──────────────────┼──────────────┐
-              ▼                  ▼              ▼
-    ┌──────────────┐   ┌─────────────┐   ┌──────────────────┐
-    │ field_       │   │ Range-check │   │ Range-check      │
-    │ to_words     │   │ epk bytes   │   │ enc bytes        │
-    │ nf (Fp),     │   │ (32B each)  │   │ (52B each)       │
-    │ cmx (Fp)     │   │ ~8 rows     │   │ ~14 rows         │
-    │ per action   │   └──────┬──────┘   └─────────┬────────┘
-    │              │          │                    │
-    │ ~300 rows    │          │                    │
-    └──────┬───────┘          │                    │
-           │                  │                    │
-           └──────────────────┼────────────────────┘
-                              │
-                    ┌─────────▼──────────────────┐
-                    │  Pack 296 bytes into 3     │
-                    │  blocks of 16 x 64-bit     │
-                    │  words [s_word_decompose]  │
-                    │                            │
-                    │  Block 1: words [0..15]    │
-                    │  Block 2: words [16..31]   │
-                    │  Block 3: words [32..36]   │
-                    │    + 11 zero-pad words     │
-                    │                            │
-                    │  ~74 rows                  │
-                    └─────────┬──────────────────┘
-                              │
-                              ▼
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+    ┌──────────────────┐  ┌──────────────┐  ┌──────────────────┐
+    │ word_from_        │  │ field_       │  │ Range-check      │
+    │ instance × 8     │  │ to_words     │  │ enc_1_tail (20B) │
+    │ decompose h_1    │  │ nf_2, cmx_2  │  │ epk_2    (32B)   │
+    │ to bytes         │  │              │  │ enc_2    (52B)   │
+    │                  │  │ ~160 rows    │  │ ~14 rows         │
+    │ ~16 rows         │  └──────┬───────┘  └────────┬─────────┘
+    └────────┬─────────┘         │                   │
+             │                   │                   │
+             └───────────────────┼───────────────────┘
+                                 │
+                       ┌─────────▼──────────────────┐
+                       │  Pack 168 remaining bytes  │
+                       │  into 21 words; form       │
+                       │  blocks 2 and 3            │
+                       │  (11 zero-pad words)       │
+                       │                            │
+                       │  ~97 rows                  │
+                       └─────────┬──────────────────┘
+                                 │
+                                 ▼
   ┌──────────────────────────────────────────────────────────┐
-  │  Compression Loop (3 calls for 296B input)               │
+  │  Compression (2 calls)                                   │
   │                                                          │
-  │  compress(h, block1, t=128, f=false)                     │
-  │  compress(h, block2, t=256, f=false)                     │
-  │  compress(h, block3, t=296, f=true)                      │
+  │  compress(h_1, block2, t=256, f=false)                   │
+  │  compress(h_2, block3, t=296, f=true)                    │
   │                                                          │
-  │  288 G calls × ~50 rows/G ≈ 14,400 rows (dominant)       │
+  │  192 G calls × 34 rows/G ≈ 6,528 rows (dominant)         │
   └──────────────────────────┬───────────────────────────────┘
                              │
                              ▼
@@ -135,20 +140,53 @@ Each action contributes 148B. For 2 actions: 296B total.
              │   field_0 = h[0] + h[1] * 2^64           │
              │   field_1 = h[2] + h[3] * 2^64           │
              │                                          │
-             │ 4 rows                                   │
+             │ ~8 rows                                  │
              └──────────────────┬───────────────────────┘
                                 │
                                 ▼
              ┌──────────────────────────────────────────┐
-             │ constrain_instance() x 2                 │
+             │ constrain_instance() × 2                 │
              │                                          │
              │ The verifier provides the expected       │
              │ action_hash (packed as 2 fields) in the  │
              │ instance column (public input).          │
              │                                          │
-             │   advice[field_0] == instance[row 0]     │
-             │   advice[field_1] == instance[row 1]     │
+             │   advice[field_0] == instance[row 8]     │
+             │   advice[field_1] == instance[row 9]     │
              └──────────────────────────────────────────┘
+
+  Total: ~6,878 rows (fits K=13 with ~1,300 headroom)
+```
+
+**Soundness:** The verifier independently computes h_1 from public action data
+and passes it as a public input. If the prover uses wrong h_1, the proof won't
+verify against the verifier's expected instance values.
+
+
+## Block Layout — 2 actions (296B → 3 blocks)
+
+```
+  Action 1 (148B):
+    nf_1 (32B) + cmx_1 (32B) + epk_1 (32B) + enc_1 (52B)
+
+  Action 2 (148B):
+    nf_2 (32B) + cmx_2 (32B) + epk_2 (32B) + enc_2 (52B)
+
+  Total: 296B = 37 x 64-bit words
+
+  Block 1 (words 0-15):  128B
+    nf_1(32) + cmx_1(32) + epk_1(32) + enc_1[0..32]
+
+  Block 2 (words 16-31): 128B
+    enc_1[32..52](20) + nf_2(32) + cmx_2(32) + epk_2(32) + enc_2[0..12]
+
+  Block 3 (words 32-36): 40B + 88B zero padding
+    enc_2[12..52](40) + zeros(88)
+
+  Compression calls:
+    compress(h, block1, t=128, f=false)   ← handled by verifier
+    compress(h, block2, t=256, f=false)
+    compress(h, block3, t=296, f=true)
 ```
 
 
@@ -192,36 +230,9 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-## Block Layout — 2 actions (296B → 3 blocks)
-
-```
-  Action 1 (148B):
-    nf_1 (32B) + cmx_1 (32B) + epk_1 (32B) + enc_1 (52B)
-
-  Action 2 (148B):
-    nf_2 (32B) + cmx_2 (32B) + epk_2 (32B) + enc_2 (52B)
-
-  Total: 296B = 37 x 64-bit words
-
-  Block 1 (words 0-15):  128B
-    nf_1(32) + cmx_1(32) + epk_1(32) + enc_1[0..32]
-
-  Block 2 (words 16-31): 128B
-    enc_1[32..52](20) + nf_2(32) + cmx_2(32) + epk_2(32) + enc_2[0..12]
-
-  Block 3 (words 32-36): 40B + 88B zero padding
-    enc_2[12..52](40) + zeros(88)
-
-  Compression calls:
-    compress(h, block1, t=128, f=false)
-    compress(h, block2, t=256, f=false)
-    compress(h, block3, t=296, f=true)
-```
-
-
 ## Compression — compress() (RFC 7693 §3.2)
 
-  Called once per block. For 296B input: 3 calls.
+  Called twice: once for block 2 and once for block 3.
 
 ```
   ┌────────────────────────────────────────────────────────────┐
@@ -251,25 +262,25 @@ Each action contributes 148B. For 2 actions: 296B total.
 
   All arithmetic is mod 2^64. Rotations are right-rotations.
 
-  Uses fused gates to minimize row count (50 rows per G, down from 63):
+  Uses fused gates and dual byte XOR to minimize row count (34 rows per G):
 
 ```
   Step  Operation                                    Gate(s)               Rows
   ───── ──────────────────────────────────────────── ───────────────────── ────
    1    v[a]+v[b]                                    s_word_add_single      1
    2    sum+x → v[a] (word+bytes)                    s_fused_add_decompose  2
-   3    (v[d] XOR v[a]) >>> 32                       q_nibble_xor × 8       8
+   3    (v[d] XOR v[a]) >>> 32                       q_nibble_xor_dual × 4  4
    4    pack(d_bytes)+v[c] → v[c] (word+bytes)       s_pack_add_decompose   2
-   5    (v[b] XOR v[c]) >>> 24                       q_nibble_xor × 8       8
+   5    (v[b] XOR v[c]) >>> 24                       q_nibble_xor_dual × 4  4
    6    pack(b_bytes)+v[a] → intermediate sum        s_pack_add             2
    7    sum+y → v[a] (word+bytes)                    s_fused_add_decompose  2
-   8    (d_bytes XOR v[a]) >>> 16                    q_nibble_xor × 8       8
+   8    (d_bytes XOR v[a]) >>> 16                    q_nibble_xor_dual × 4  4
    9    pack(d_bytes2)+v[c] → v[c] (word+bytes)      s_pack_add_decompose   2
-  10    (b_bytes XOR v[c])                           q_nibble_xor × 8       8
+  10    (b_bytes XOR v[c])                           q_nibble_xor_dual × 4  4
   11    left-rotate 1 bit (R4=63)                    s_left_shift_1         3
   12    pack shifted → v[b] (word+bytes)             s_word_decompose       2
   13    pack d_bytes2 → v[d] (word+bytes)            s_word_decompose       2
-                                                                     Total: 50
+                                                                     Total: 34
 ```
 
   **Key optimization:** Intermediate v[d] and v[b] byte arrays from XOR
@@ -277,8 +288,10 @@ Each action contributes 148B. For 2 actions: 296B total.
   needed, saving 4 rows per G. Only the final v[d] and v[b] are packed.
 
   **XOR:** Each byte XOR splits both input bytes into nibbles, performs
-  two 4-bit XOR lookups (lo and hi), and recombines. 1 row per byte XOR,
-  using 9 of 10 advice columns.
+  two 4-bit XOR lookups (lo and hi), and recombines. Dual byte XOR
+  (`q_nibble_xor_dual`) processes 2 byte XORs per row using 18 advice
+  columns (A0-A8 for the first byte, A9-A17 for the second), halving
+  the XOR row count from 8 to 4 per word.
 
   **Rotation details:**
   - **R1=32:** Pure byte shuffle `[4,5,6,7,0,1,2,3]` — **zero constraints**
@@ -294,7 +307,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   - 1 single-row add (s_word_add_single)
   - 2 pack-add-decompose (s_pack_add_decompose)
   - 1 pack-add (s_pack_add)
-  - 4 XOR operations (8 byte lookups each = 32 lookups)
+  - 4 XOR operations (4 dual byte lookups each = 16 rows, 32 lookups)
   - 3 free byte shuffles (R1, R2, R3)
   - 1 left-shift-1 (R4, 24 constraints)
   - 2 byte-to-word packs (s_word_decompose)
@@ -327,7 +340,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   Instead of a full byte XOR table (256 × 256 = 65,536 rows, requiring
   K≥17), each byte is split into two 4-bit nibbles (lo and hi), and two
   smaller lookups are performed against a single 16 × 16 = 256-row table.
-  This enables K=14 (8x smaller than K=17).
+  This enables K=13 (8,192 rows).
 
   **Worked example** — `0xA7 XOR 0x3B`:
 ```
@@ -341,8 +354,10 @@ Each action contributes 148B. For 2 actions: 296B total.
     Check: 0xA7 XOR 0x3B = 0x9C  ✓
 ```
 
-  Each byte XOR uses 9 columns on 1 row, with 2 queries into the
-  same table and a gate (`q_nibble_xor`) constraining `byte = lo + hi * 16`.
+  **Dual byte XOR** (`q_nibble_xor_dual`): Processes 2 byte XORs per row
+  using 18 columns — A0-A8 for the first byte (same layout as single XOR)
+  and A9-A17 for the second byte. Each word XOR (8 bytes) takes 4 rows
+  instead of 8, halving XOR cost and reducing G from 50 to 34 rows.
 
   **2. Byte Range Table** (256 entries):
 ```
@@ -363,7 +378,6 @@ Each action contributes 148B. For 2 actions: 296B total.
   Gate                    Purpose                                   Cost
   ─────────────────────── ───────────────────────────────────────── ──────────
   s_word_decompose        word = b1 + b2*2^8 + ... + b8*2^56        1 constraint
-  s_word_add              lhs + rhs = out + carry*2^64              2 constraints
   s_fused_add_decompose   lhs + rhs = word = bytes + carry*2^64     3 constraints
   s_word_add_single       lhs + rhs = result + carry*2^64 (1 row)   2 constraints
   s_pack_add_decompose    pack(in) + other = word = bytes + c*2^64  3 constraints
@@ -372,7 +386,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   s_field_recompose       field = sum_01 + sum_23*2^128             1 constraint
   s_word_combine          w64 = w32_lo + w32_hi*2^32                1 constraint
   s_left_shift_1          2*in + c_in = out + 256*c_out             3 constraints/byte
-  q_nibble_xor            byte = lo + hi*16 (decompose)             3 constraints
+  q_nibble_xor_dual       2 × (byte = lo + hi*16) on A0-A8/A9-A17  6 constraints
 ```
 
   **Lookups:**
@@ -389,16 +403,10 @@ Each action contributes 148B. For 2 actions: 296B total.
 
 ## Why epk/enc Range Checks Are In-Circuit
 
-  The epk (32B) and enc_prefix (52B) bytes are advice (witness) cells,
-  not instance column values. Without in-circuit range checks, the
-  word decomposition gate `word = b0 + b1·256 + ... + b7·256^7` has
+  The epk (32B) and enc_prefix (52B) bytes for action 2, plus the
+  enc_1_tail (20B) from action 1, are advice (witness) cells, not
+  instance column values. Without in-circuit range checks, the word
+  decomposition gate `word = b0 + b1·256 + ... + b7·256^7` has
   multiple solutions in field arithmetic — e.g. b0=300, b1=x produces
   the same word as b0=44, b1=x+1. A prover could feed arbitrary field
   elements as "bytes" and the circuit would hash a non-byte message.
-
-  An alternative is to promote epk/enc to instance columns and have
-  the verifier reject any value >= 256 externally. This would remove
-  ~22 rows of in-circuit lookups per action, but add 84 instance
-  bindings per action (168 total) — far more expensive than the
-  current 2 instance values (the hash output). The in-circuit range
-  checks are the better tradeoff.

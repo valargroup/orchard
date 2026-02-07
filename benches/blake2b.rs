@@ -14,7 +14,7 @@ use halo2_proofs::{
     transcript::{Blake2bRead, Blake2bWrite},
 };
 use orchard::circuit::blake2b::{
-    assign_free_advice, Blake2bChip, Blake2bConfig, CompactActionCells,
+    assign_free_advice, compute_h1, Blake2bChip, Blake2bConfig, Blake2bWord, CompactActionCells,
 };
 use pasta_curves::{pallas, vesta};
 use rand::rngs::OsRng;
@@ -65,15 +65,15 @@ const C_ENC_PREFIX_2: [u8; 52] = [
     0x20, 0x31, 0x42, 0x53,
 ];
 
-const K: u32 = 14;
+const K: u32 = 13;
 
-/// Circuit hashing 2 compact actions via `process_compact_action_hash`.
+// ---- Circuit for benchmarks ----
+
+/// Circuit with precomputed block 1 state (h_1) for benchmarking.
 #[derive(Clone)]
-struct TwoActionBenchCircuit {
-    nf_1: Value<pallas::Base>,
-    cmx_1: Value<pallas::Base>,
-    epk_1: Value<[u8; 32]>,
-    enc_1: Value<[u8; 52]>,
+struct PrecomputedBenchCircuit {
+    h_1_words: [Value<pallas::Base>; 8],
+    enc_1_tail: Value<[u8; 20]>,
     nf_2: Value<pallas::Base>,
     cmx_2: Value<pallas::Base>,
     epk_2: Value<[u8; 32]>,
@@ -81,21 +81,22 @@ struct TwoActionBenchCircuit {
 }
 
 #[derive(Clone)]
-struct TwoActionBenchConfig {
+struct PrecomputedBenchConfig {
     blake2b_config: Blake2bConfig<pallas::Base>,
     instance: Column<Instance>,
 }
 
-impl Circuit<pallas::Base> for TwoActionBenchCircuit {
-    type Config = TwoActionBenchConfig;
+impl Circuit<pallas::Base> for PrecomputedBenchCircuit {
+    type Config = PrecomputedBenchConfig;
     type FloorPlanner = floor_planner::V1;
 
     fn without_witnesses(&self) -> Self {
         Self {
-            nf_1: Value::unknown(),
-            cmx_1: Value::unknown(),
-            epk_1: Value::unknown(),
-            enc_1: Value::unknown(),
+            h_1_words: [
+                Value::unknown(), Value::unknown(), Value::unknown(), Value::unknown(),
+                Value::unknown(), Value::unknown(), Value::unknown(), Value::unknown(),
+            ],
+            enc_1_tail: Value::unknown(),
             nf_2: Value::unknown(),
             cmx_2: Value::unknown(),
             epk_2: Value::unknown(),
@@ -104,18 +105,7 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
     }
 
     fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
-        let advices = [
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        ];
+        let advices: [_; 18] = core::array::from_fn(|_| meta.advice_column());
 
         for advice in advices.iter() {
             meta.enable_equality(*advice);
@@ -127,7 +117,7 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
         let constants = meta.fixed_column();
         meta.enable_constant(constants);
 
-        TwoActionBenchConfig {
+        PrecomputedBenchConfig {
             blake2b_config: Blake2bConfig::configure(meta, advices),
             instance,
         }
@@ -138,6 +128,43 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<pallas::Base>,
     ) -> Result<(), Error> {
+        let col = config.blake2b_config.advices[0];
+        let chip = Blake2bChip::construct(config.blake2b_config.clone());
+
+        // Copy h_1 from instance
+        let mut h_1_vec: Vec<Blake2bWord<pallas::Base>> = Vec::with_capacity(8);
+        for i in 0..8 {
+            let word_cell = assign_free_advice(
+                layouter.namespace(|| format!("h1_{}", i)),
+                col,
+                self.h_1_words[i],
+            )?;
+            layouter.constrain_instance(word_cell.cell(), config.instance, i)?;
+            let word = chip.word_from_instance(
+                layouter.namespace(|| format!("h1_decomp_{}", i)),
+                &word_cell,
+            )?;
+            h_1_vec.push(word);
+        }
+        let h_1: [Blake2bWord<pallas::Base>; 8] = h_1_vec.try_into().unwrap();
+
+        // Assign enc_1_tail (20 bytes)
+        let mut enc_1_tail_cells = Vec::with_capacity(20);
+        for i in 0..20 {
+            let val = self.enc_1_tail.map(|bytes| pallas::Base::from(bytes[i] as u64));
+            enc_1_tail_cells.push(assign_free_advice(
+                layouter.namespace(|| format!("enc1t_{}", i)),
+                col,
+                val,
+            )?);
+        }
+        let enc_1_tail: [halo2_proofs::circuit::AssignedCell<pallas::Base, pallas::Base>; 20] =
+            enc_1_tail_cells.try_into().unwrap();
+
+        // Assign action_2
+        let nf_2 = assign_free_advice(layouter.namespace(|| "nf_2"), col, self.nf_2)?;
+        let cmx_2 = assign_free_advice(layouter.namespace(|| "cmx_2"), col, self.cmx_2)?;
+
         fn assign_bytes(
             layouter: &mut impl Layouter<pallas::Base>,
             col: halo2_proofs::plonk::Column<halo2_proofs::plonk::Advice>,
@@ -158,23 +185,6 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
             Ok(cells)
         }
 
-        let col = config.blake2b_config.advices[0];
-
-        // Action 1
-        let nf_1 = assign_free_advice(layouter.namespace(|| "nf_1"), col, self.nf_1)?;
-        let cmx_1 = assign_free_advice(layouter.namespace(|| "cmx_1"), col, self.cmx_1)?;
-        let epk_1_cells = assign_bytes(
-            &mut layouter, col, "epk_1",
-            self.epk_1.as_ref().map(|b| b.as_ref()), 32,
-        )?;
-        let enc_1_cells = assign_bytes(
-            &mut layouter, col, "enc_1",
-            self.enc_1.as_ref().map(|b| b.as_ref()), 52,
-        )?;
-
-        // Action 2
-        let nf_2 = assign_free_advice(layouter.namespace(|| "nf_2"), col, self.nf_2)?;
-        let cmx_2 = assign_free_advice(layouter.namespace(|| "cmx_2"), col, self.cmx_2)?;
         let epk_2_cells = assign_bytes(
             &mut layouter, col, "epk_2",
             self.epk_2.as_ref().map(|b| b.as_ref()), 32,
@@ -184,13 +194,6 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
             self.enc_2.as_ref().map(|b| b.as_ref()), 52,
         )?;
 
-        let action_1 = CompactActionCells {
-            nf: nf_1,
-            cmx: cmx_1,
-            epk_bytes: epk_1_cells.try_into().unwrap(),
-            enc_prefix: enc_1_cells.try_into().unwrap(),
-        };
-
         let action_2 = CompactActionCells {
             nf: nf_2,
             cmx: cmx_2,
@@ -198,17 +201,16 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
             enc_prefix: enc_2_cells.try_into().unwrap(),
         };
 
-        let blake2b_chip = Blake2bChip::construct(config.blake2b_config);
-        let result = blake2b_chip.process_compact_action_hash(
+        let result = chip.process_precomputed_action_hash(
             &mut layouter,
-            &action_1,
+            &h_1,
+            &enc_1_tail,
             &action_2,
-            b"ZTxIdOrcActCHash",
         )?;
 
-        let encoded = blake2b_chip.encode_result(&mut layouter, &result)?;
+        let encoded = chip.encode_result(&mut layouter, &result)?;
         for (i, field) in encoded.iter().enumerate() {
-            layouter.constrain_instance(field.cell(), config.instance, i)?;
+            layouter.constrain_instance(field.cell(), config.instance, 8 + i)?;
         }
 
         Ok(())
@@ -216,9 +218,20 @@ impl Circuit<pallas::Base> for TwoActionBenchCircuit {
 }
 
 fn compute_expected_words() -> Vec<pallas::Base> {
+    let personalization = b"ZTxIdOrcActCHash";
+    let h_1 = compute_h1(
+        &NF_OLD, &CMX, &EPHEMERAL_KEY, &C_ENC_PREFIX, personalization,
+    );
+
+    let mut instance: Vec<pallas::Base> = Vec::with_capacity(10);
+    for &word in &h_1 {
+        instance.push(pallas::Base::from(word));
+    }
+
+    // Hash output
     let expected_hash = blake2b_simd::Params::new()
         .hash_length(32)
-        .personal(b"ZTxIdOrcActCHash")
+        .personal(personalization)
         .to_state()
         .update(&NF_OLD)
         .update(&CMX)
@@ -231,26 +244,33 @@ fn compute_expected_words() -> Vec<pallas::Base> {
         .finalize();
 
     let hash_bytes = expected_hash.as_bytes();
-    (0..2)
+    let hash_fields: Vec<pallas::Base> = (0..2)
         .map(|i| {
             let w0 = u64::from_le_bytes(hash_bytes[i * 16..i * 16 + 8].try_into().unwrap());
             let w1 = u64::from_le_bytes(hash_bytes[i * 16 + 8..i * 16 + 16].try_into().unwrap());
             pallas::Base::from(w0) + pallas::Base::from(w1) * pallas::Base::from_u128(1u128 << 64)
         })
-        .collect()
+        .collect();
+    instance.extend_from_slice(&hash_fields);
+    instance
 }
 
-fn build_circuit() -> TwoActionBenchCircuit {
-    let nf_1 = pallas::Base::from_repr(NF_OLD).expect("valid field element");
-    let cmx_1 = pallas::Base::from_repr(CMX).expect("valid field element");
+fn build_circuit() -> PrecomputedBenchCircuit {
+    let personalization = b"ZTxIdOrcActCHash";
+    let h_1 = compute_h1(
+        &NF_OLD, &CMX, &EPHEMERAL_KEY, &C_ENC_PREFIX, personalization,
+    );
+    let h_1_words = h_1.map(|w| Value::known(pallas::Base::from(w)));
+
+    let mut enc_1_tail = [0u8; 20];
+    enc_1_tail.copy_from_slice(&C_ENC_PREFIX[32..52]);
+
     let nf_2 = pallas::Base::from_repr(NF_OLD_2).expect("valid field element");
     let cmx_2 = pallas::Base::from_repr(CMX_2).expect("valid field element");
 
-    TwoActionBenchCircuit {
-        nf_1: Value::known(nf_1),
-        cmx_1: Value::known(cmx_1),
-        epk_1: Value::known(EPHEMERAL_KEY),
-        enc_1: Value::known(C_ENC_PREFIX),
+    PrecomputedBenchCircuit {
+        h_1_words,
+        enc_1_tail: Value::known(enc_1_tail),
         nf_2: Value::known(nf_2),
         cmx_2: Value::known(cmx_2),
         epk_2: Value::known(EPHEMERAL_KEY_2),
@@ -265,7 +285,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     let instance_row: &[&[pallas::Base]] = &[instance_col];
     let instances: &[&[&[pallas::Base]]] = &[instance_row];
 
-    // Build params/keys once for proving and verifying benchmarks
     let params: Params<vesta::Affine> = Params::new(K);
     let vk = plonk::keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
     let pk = plonk::keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk should not fail");

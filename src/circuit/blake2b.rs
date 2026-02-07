@@ -5,7 +5,7 @@
 //!
 //! Field element inputs (nf, cmx) are single Fp values, converted to 32 bytes
 //! each. Bytes are range-checked via a lookup table and packed into 64-bit words
-//! — BLAKE2b's native word size — via `word_decompose` and `word_combine` gates.
+//! — BLAKE2b's native word size — via `s_word_decompose` and `s_word_combine` gates.
 //! Recomposition is verified via `s_result_encode` and `s_field_recompose` gates.
 //!
 //! XOR operations use a 16×16 nibble-level lookup table. Each byte XOR is split
@@ -29,8 +29,6 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use byteorder::{ByteOrder, LittleEndian};
-use core::convert::TryInto;
 use core::marker::PhantomData;
 use group::ff::PrimeField;
 use halo2_gadgets::utilities::bool_check;
@@ -53,6 +51,14 @@ const A6: usize = 6;
 const A7: usize = 7;
 const A8: usize = 8;
 const A9: usize = 9;
+const A10: usize = 10;
+const A11: usize = 11;
+const A12: usize = 12;
+const A13: usize = 13;
+const A14: usize = 14;
+const A15: usize = 15;
+const A16: usize = 16;
+const A17: usize = 17;
 
 // ----------------
 // Value helpers
@@ -64,15 +70,6 @@ const A9: usize = 9;
 fn f_to_u8_le<F: PrimeField>(f: &F) -> u8 {
     let repr = f.to_repr();
     repr.as_ref()[0]
-}
-
-/// Extract the least-significant 32 bits from a field element's little-endian representation.
-///
-/// Used to recover a 32-bit word from a field element known to be in [0, 2^32).
-fn f_to_u32_le<F: PrimeField>(f: &F) -> u32 {
-    let repr = f.to_repr();
-    let bytes = repr.as_ref();
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// Reconstruct a word `Value` from assigned byte cells (little-endian).
@@ -174,7 +171,6 @@ const SIGMA: [[usize; 16]; 10] = [
 const R1: usize = 32;
 const R2: usize = 24;
 const R3: usize = 16;
-const R4: usize = 63;
 
 // Number of rounds in the compression function.
 const ROUNDS: usize = 12;
@@ -201,11 +197,9 @@ pub struct Blake2bChip<F: PrimeField> {
 #[derive(Clone, Debug)]
 pub struct Blake2bConfig<F: PrimeField> {
     /// Advice columns used by the chip.
-    pub advices: [Column<Advice>; 10],
+    pub advices: [Column<Advice>; 18],
     /// Selector for word decomposition gate: word = sum(byte[i] * 256^i).
     pub s_word_decompose: Selector,
-    /// Selector for word addition gate: lhs + rhs = out + carry * 2^64.
-    pub s_word_add: Selector,
     /// Selector for result encoding gate: field = word_1 + word_2 * 2^64.
     pub s_result_encode: Selector,
     /// Selector for field recomposition gate: field = words[0..1] + words[2..3] * 2^128.
@@ -222,8 +216,8 @@ pub struct Blake2bConfig<F: PrimeField> {
     pub s_pack_add_decompose: Selector,
     /// Selector for fused pack-and-add: pack input bytes + other_word = result + carry*2^64.
     pub s_pack_add: Selector,
-    /// Complex selector for nibble XOR lookup (two 3-column lookups + decompose gate).
-    q_nibble_xor: Selector,
+    /// Complex selector for dual nibble XOR (two byte XORs per row on A0-A8 + A9-A17).
+    q_nibble_xor_dual: Selector,
     /// Complex selector for 8-byte range check lookup (checks A0..A7 against [0,255]).
     q_range_check_8: Selector,
     /// Lookup table columns for byte XOR.
@@ -237,7 +231,7 @@ pub struct Blake2bConfig<F: PrimeField> {
 
 /// A compact Orchard action with pre-assigned witness cells.
 ///
-/// Used as input to [`Blake2bChip::process_compact_action_hash`] for the
+/// Used as input to [`Blake2bChip::process_precomputed_action_hash`] for the
 /// 2-action hash per ZIP-244 `hashOrchardActions`.
 ///
 /// Each action provides 148 bytes: nf(32B) + cmx(32B) + epk(32B) + enc_prefix(52B).
@@ -270,10 +264,9 @@ impl<F: PrimeField> Blake2bConfig<F> {
     /// Configure the BLAKE2b chip.
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
-        advices: [Column<Advice>; 10],
+        advices: [Column<Advice>; 18],
     ) -> Blake2bConfig<F> {
         let s_word_decompose = meta.selector();
-        let s_word_add = meta.selector();
         let s_result_encode = meta.selector();
         let s_field_recompose = meta.selector();
         let s_word_combine = meta.selector();
@@ -284,8 +277,8 @@ impl<F: PrimeField> Blake2bConfig<F> {
         let s_pack_add = meta.selector();
 
         // Complex selectors for use in lookup expressions
-        let q_nibble_xor = meta.complex_selector();
         let q_range_check_8 = meta.complex_selector();
+        let q_nibble_xor_dual = meta.complex_selector();
 
         // Lookup table columns
         let xor_table_lhs = meta.lookup_table_column();
@@ -318,24 +311,6 @@ impl<F: PrimeField> Blake2bConfig<F> {
                         + byte_8 * F::from(1u64 << 56)
                         - word),
             ]
-        });
-
-        // lhs + rhs = out + carry * 2^64, with carry boolean-constrained.
-        meta.create_gate("word add", |meta| {
-            let s_word_add = meta.query_selector(s_word_add);
-            let lhs = meta.query_advice(advices[A0], Rotation::cur());
-            let rhs = meta.query_advice(advices[A1], Rotation::cur());
-            let out = meta.query_advice(advices[A0], Rotation::next());
-            let carry = meta.query_advice(advices[A1], Rotation::next());
-            let equal = lhs + rhs - carry.clone() * F::from_u128(1u128 << 64) - out;
-
-            Constraints::with_selector(
-                s_word_add,
-                [
-                    ("carry bool check", bool_check(carry)),
-                    ("equal check", equal),
-                ],
-            )
         });
 
         // field = word_1 + word_2 * 2^64  (16 bytes packed into one Pallas field element)
@@ -514,51 +489,6 @@ impl<F: PrimeField> Blake2bConfig<F> {
             )
         });
 
-        // Nibble XOR: decompose/recompose gate
-        // Row layout: A0=byte_a, A1=byte_b, A2=lo_a, A3=hi_a, A4=lo_b, A5=hi_b,
-        //             A6=lo_out, A7=hi_out, A8=out_byte
-        meta.create_gate("nibble xor decompose", |meta| {
-            let q = meta.query_selector(q_nibble_xor);
-            let byte_a = meta.query_advice(advices[A0], Rotation::cur());
-            let byte_b = meta.query_advice(advices[A1], Rotation::cur());
-            let lo_a = meta.query_advice(advices[A2], Rotation::cur());
-            let hi_a = meta.query_advice(advices[A3], Rotation::cur());
-            let lo_b = meta.query_advice(advices[A4], Rotation::cur());
-            let hi_b = meta.query_advice(advices[A5], Rotation::cur());
-            let lo_out = meta.query_advice(advices[A6], Rotation::cur());
-            let hi_out = meta.query_advice(advices[A7], Rotation::cur());
-            let out_byte = meta.query_advice(advices[A8], Rotation::cur());
-
-            Constraints::with_selector(
-                q,
-                vec![
-                    byte_a - lo_a - hi_a * F::from(16),
-                    byte_b - lo_b - hi_b * F::from(16),
-                    out_byte - lo_out - hi_out * F::from(16),
-                ],
-            )
-        });
-
-        // Lo nibble XOR lookup: (A2=lo_a, A4=lo_b, A6=lo_out)
-        meta.lookup(|meta| {
-            let q = meta.query_selector(q_nibble_xor);
-            vec![
-                (q.clone() * meta.query_advice(advices[A2], Rotation::cur()), xor_table_lhs),
-                (q.clone() * meta.query_advice(advices[A4], Rotation::cur()), xor_table_rhs),
-                (q * meta.query_advice(advices[A6], Rotation::cur()), xor_table_out),
-            ]
-        });
-
-        // Hi nibble XOR lookup: (A3=hi_a, A5=hi_b, A7=hi_out)
-        meta.lookup(|meta| {
-            let q = meta.query_selector(q_nibble_xor);
-            vec![
-                (q.clone() * meta.query_advice(advices[A3], Rotation::cur()), xor_table_lhs),
-                (q.clone() * meta.query_advice(advices[A5], Rotation::cur()), xor_table_rhs),
-                (q * meta.query_advice(advices[A7], Rotation::cur()), xor_table_out),
-            ]
-        });
-
         // Byte range lookup: each of A0..A7 must be in [0, 255].
         // All 8 lookups share q_range_check_8, so enabling it on one row
         // simultaneously range-checks all 8 advice columns.
@@ -571,10 +501,83 @@ impl<F: PrimeField> Blake2bConfig<F> {
             });
         }
 
+        // Dual nibble XOR: two byte XORs per row
+        // Row layout: A0-A8 = first byte XOR, A9-A17 = second byte XOR
+        meta.create_gate("dual nibble xor decompose", |meta| {
+            let q = meta.query_selector(q_nibble_xor_dual);
+
+            let byte_a1 = meta.query_advice(advices[A0], Rotation::cur());
+            let lo_a1 = meta.query_advice(advices[A2], Rotation::cur());
+            let hi_a1 = meta.query_advice(advices[A3], Rotation::cur());
+            let byte_b1 = meta.query_advice(advices[A1], Rotation::cur());
+            let lo_b1 = meta.query_advice(advices[A4], Rotation::cur());
+            let hi_b1 = meta.query_advice(advices[A5], Rotation::cur());
+            let lo_out1 = meta.query_advice(advices[A6], Rotation::cur());
+            let hi_out1 = meta.query_advice(advices[A7], Rotation::cur());
+            let out1 = meta.query_advice(advices[A8], Rotation::cur());
+
+            let byte_a2 = meta.query_advice(advices[A9], Rotation::cur());
+            let lo_a2 = meta.query_advice(advices[A11], Rotation::cur());
+            let hi_a2 = meta.query_advice(advices[A12], Rotation::cur());
+            let byte_b2 = meta.query_advice(advices[A10], Rotation::cur());
+            let lo_b2 = meta.query_advice(advices[A13], Rotation::cur());
+            let hi_b2 = meta.query_advice(advices[A14], Rotation::cur());
+            let lo_out2 = meta.query_advice(advices[A15], Rotation::cur());
+            let hi_out2 = meta.query_advice(advices[A16], Rotation::cur());
+            let out2 = meta.query_advice(advices[A17], Rotation::cur());
+
+            Constraints::with_selector(
+                q,
+                vec![
+                    byte_a1 - lo_a1 - hi_a1 * F::from(16),
+                    byte_b1 - lo_b1 - hi_b1 * F::from(16),
+                    out1 - lo_out1 - hi_out1 * F::from(16),
+                    byte_a2 - lo_a2 - hi_a2 * F::from(16),
+                    byte_b2 - lo_b2 - hi_b2 * F::from(16),
+                    out2 - lo_out2 - hi_out2 * F::from(16),
+                ],
+            )
+        });
+
+        // Dual XOR lookups — first byte (lo and hi nibbles)
+        meta.lookup(|meta| {
+            let q = meta.query_selector(q_nibble_xor_dual);
+            vec![
+                (q.clone() * meta.query_advice(advices[A2], Rotation::cur()), xor_table_lhs),
+                (q.clone() * meta.query_advice(advices[A4], Rotation::cur()), xor_table_rhs),
+                (q * meta.query_advice(advices[A6], Rotation::cur()), xor_table_out),
+            ]
+        });
+        meta.lookup(|meta| {
+            let q = meta.query_selector(q_nibble_xor_dual);
+            vec![
+                (q.clone() * meta.query_advice(advices[A3], Rotation::cur()), xor_table_lhs),
+                (q.clone() * meta.query_advice(advices[A5], Rotation::cur()), xor_table_rhs),
+                (q * meta.query_advice(advices[A7], Rotation::cur()), xor_table_out),
+            ]
+        });
+
+        // Dual XOR lookups — second byte (lo and hi nibbles)
+        meta.lookup(|meta| {
+            let q = meta.query_selector(q_nibble_xor_dual);
+            vec![
+                (q.clone() * meta.query_advice(advices[A11], Rotation::cur()), xor_table_lhs),
+                (q.clone() * meta.query_advice(advices[A13], Rotation::cur()), xor_table_rhs),
+                (q * meta.query_advice(advices[A15], Rotation::cur()), xor_table_out),
+            ]
+        });
+        meta.lookup(|meta| {
+            let q = meta.query_selector(q_nibble_xor_dual);
+            vec![
+                (q.clone() * meta.query_advice(advices[A12], Rotation::cur()), xor_table_lhs),
+                (q.clone() * meta.query_advice(advices[A14], Rotation::cur()), xor_table_rhs),
+                (q * meta.query_advice(advices[A16], Rotation::cur()), xor_table_out),
+            ]
+        });
+
         Blake2bConfig {
             advices,
             s_word_decompose,
-            s_word_add,
             s_result_encode,
             s_field_recompose,
             s_word_combine,
@@ -583,7 +586,7 @@ impl<F: PrimeField> Blake2bConfig<F> {
             s_word_add_single,
             s_pack_add_decompose,
             s_pack_add,
-            q_nibble_xor,
+            q_nibble_xor_dual,
             q_range_check_8,
             xor_table_lhs,
             xor_table_rhs,
@@ -597,21 +600,6 @@ impl<F: PrimeField> Blake2bConfig<F> {
 // ---- Blake2bWord constructors and utilities ----
 
 impl<F: PrimeField> Blake2bWord<F> {
-    /// Create a `Blake2bWord` from a constant u64 value with full decomposition gates.
-    pub fn from_constant_u64(
-        value: u64,
-        layouter: &mut impl Layouter<F>,
-        chip: &Blake2bChip<F>,
-    ) -> Result<Self, Error> {
-        let word = assign_free_constant(
-            layouter.namespace(|| "constant word"),
-            chip.config.advices[A0],
-            F::from(value),
-        )?;
-        // Decompose via from_word (which enables s_word_decompose + q_range_check_8)
-        Blake2bWord::from_word(chip, layouter.namespace(|| "decompose constant"), word)
-    }
-
     /// Create a `Blake2bWord` from a constant u64 WITHOUT decomposition gates.
     ///
     /// The word and each byte are pinned to the fixed column via
@@ -813,28 +801,27 @@ impl<F: PrimeField> Blake2bChip<F> {
 
     // ---- Low-level primitives ----
 
-    /// XOR two bytes via nibble lookup table.
+    /// XOR two pairs of bytes via nibble lookup table (dual: 2 byte XORs per row).
     ///
-    /// Row layout: A0=byte_a, A1=byte_b, A2=lo_a, A3=hi_a, A4=lo_b, A5=hi_b,
-    ///             A6=lo_out, A7=hi_out, A8=out_byte
-    fn byte_xor_lookup(
+    /// Row layout: A0-A8 = first byte XOR, A9-A17 = second byte XOR.
+    fn dual_byte_xor(
         &self,
         mut layouter: impl Layouter<F>,
-        lhs: &AssignedCell<F, F>,
-        rhs: &AssignedCell<F, F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
+        lhs1: &AssignedCell<F, F>,
+        rhs1: &AssignedCell<F, F>,
+        lhs2: &AssignedCell<F, F>,
+        rhs2: &AssignedCell<F, F>,
+    ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>), Error> {
         layouter.assign_region(
-            || "nibble xor",
+            || "dual nibble xor",
             |mut region| {
-                self.config.q_nibble_xor.enable(&mut region, 0)?;
+                self.config.q_nibble_xor_dual.enable(&mut region, 0)?;
 
-                // A0 = byte_a (copy)
-                lhs.copy_advice(|| "byte_a", &mut region, self.config.advices[A0], 0)?;
-                // A1 = byte_b (copy)
-                rhs.copy_advice(|| "byte_b", &mut region, self.config.advices[A1], 0)?;
+                // First byte XOR (A0-A8)
+                lhs1.copy_advice(|| "byte_a1", &mut region, self.config.advices[A0], 0)?;
+                rhs1.copy_advice(|| "byte_b1", &mut region, self.config.advices[A1], 0)?;
 
-                // Compute nibble decompositions and XOR
-                let vals = lhs.value().zip(rhs.value()).map(|(l, r)| {
+                let vals1 = lhs1.value().zip(rhs1.value()).map(|(l, r)| {
                     let l_byte = f_to_u8_le(l);
                     let r_byte = f_to_u8_le(r);
                     let lo_a = l_byte & 0x0F;
@@ -847,47 +834,47 @@ impl<F: PrimeField> Blake2bChip<F> {
                     (lo_a, hi_a, lo_b, hi_b, lo_out, hi_out, out_byte)
                 });
 
-                // A2 = lo_a
-                region.assign_advice(
-                    || "lo_a", self.config.advices[A2], 0,
-                    || vals.map(|v| F::from(v.0 as u64)),
-                )?;
-                // A3 = hi_a
-                region.assign_advice(
-                    || "hi_a", self.config.advices[A3], 0,
-                    || vals.map(|v| F::from(v.1 as u64)),
-                )?;
-                // A4 = lo_b
-                region.assign_advice(
-                    || "lo_b", self.config.advices[A4], 0,
-                    || vals.map(|v| F::from(v.2 as u64)),
-                )?;
-                // A5 = hi_b
-                region.assign_advice(
-                    || "hi_b", self.config.advices[A5], 0,
-                    || vals.map(|v| F::from(v.3 as u64)),
-                )?;
-                // A6 = lo_out
-                region.assign_advice(
-                    || "lo_out", self.config.advices[A6], 0,
-                    || vals.map(|v| F::from(v.4 as u64)),
-                )?;
-                // A7 = hi_out
-                region.assign_advice(
-                    || "hi_out", self.config.advices[A7], 0,
-                    || vals.map(|v| F::from(v.5 as u64)),
-                )?;
-                // A8 = out_byte
-                region.assign_advice(
-                    || "out_byte", self.config.advices[A8], 0,
-                    || vals.map(|v| F::from(v.6 as u64)),
-                )
+                region.assign_advice(|| "lo_a1", self.config.advices[A2], 0, || vals1.map(|v| F::from(v.0 as u64)))?;
+                region.assign_advice(|| "hi_a1", self.config.advices[A3], 0, || vals1.map(|v| F::from(v.1 as u64)))?;
+                region.assign_advice(|| "lo_b1", self.config.advices[A4], 0, || vals1.map(|v| F::from(v.2 as u64)))?;
+                region.assign_advice(|| "hi_b1", self.config.advices[A5], 0, || vals1.map(|v| F::from(v.3 as u64)))?;
+                region.assign_advice(|| "lo_out1", self.config.advices[A6], 0, || vals1.map(|v| F::from(v.4 as u64)))?;
+                region.assign_advice(|| "hi_out1", self.config.advices[A7], 0, || vals1.map(|v| F::from(v.5 as u64)))?;
+                let out1 = region.assign_advice(|| "out1", self.config.advices[A8], 0, || vals1.map(|v| F::from(v.6 as u64)))?;
+
+                // Second byte XOR (A9-A17)
+                lhs2.copy_advice(|| "byte_a2", &mut region, self.config.advices[A9], 0)?;
+                rhs2.copy_advice(|| "byte_b2", &mut region, self.config.advices[A10], 0)?;
+
+                let vals2 = lhs2.value().zip(rhs2.value()).map(|(l, r)| {
+                    let l_byte = f_to_u8_le(l);
+                    let r_byte = f_to_u8_le(r);
+                    let lo_a = l_byte & 0x0F;
+                    let hi_a = l_byte >> 4;
+                    let lo_b = r_byte & 0x0F;
+                    let hi_b = r_byte >> 4;
+                    let lo_out = lo_a ^ lo_b;
+                    let hi_out = hi_a ^ hi_b;
+                    let out_byte = lo_out | (hi_out << 4);
+                    (lo_a, hi_a, lo_b, hi_b, lo_out, hi_out, out_byte)
+                });
+
+                region.assign_advice(|| "lo_a2", self.config.advices[A11], 0, || vals2.map(|v| F::from(v.0 as u64)))?;
+                region.assign_advice(|| "hi_a2", self.config.advices[A12], 0, || vals2.map(|v| F::from(v.1 as u64)))?;
+                region.assign_advice(|| "lo_b2", self.config.advices[A13], 0, || vals2.map(|v| F::from(v.2 as u64)))?;
+                region.assign_advice(|| "hi_b2", self.config.advices[A14], 0, || vals2.map(|v| F::from(v.3 as u64)))?;
+                region.assign_advice(|| "lo_out2", self.config.advices[A15], 0, || vals2.map(|v| F::from(v.4 as u64)))?;
+                region.assign_advice(|| "hi_out2", self.config.advices[A16], 0, || vals2.map(|v| F::from(v.5 as u64)))?;
+                let out2 = region.assign_advice(|| "out2", self.config.advices[A17], 0, || vals2.map(|v| F::from(v.6 as u64)))?;
+
+                Ok((out1, out2))
             },
         )
     }
 
-    /// XOR two 64-bit words byte-by-byte via lookup table.
+    /// XOR two 64-bit words byte-by-byte via dual lookup table.
     ///
+    /// Processes 2 bytes per row (4 rows instead of 8).
     /// Returns 8 result byte cells (range-checked by the XOR table).
     fn word_xor(
         &self,
@@ -896,13 +883,16 @@ impl<F: PrimeField> Blake2bChip<F> {
         y: &[AssignedCell<F, F>; 8],
     ) -> Result<[AssignedCell<F, F>; 8], Error> {
         let mut result = Vec::with_capacity(8);
-        for i in 0..8 {
-            let out = self.byte_xor_lookup(
-                layouter.namespace(|| format!("xor_byte_{}", i)),
+        for i in (0..8).step_by(2) {
+            let (r1, r2) = self.dual_byte_xor(
+                layouter.namespace(|| format!("xor_bytes_{}_{}", i, i + 1)),
                 &x[i],
                 &y[i],
+                &x[i + 1],
+                &y[i + 1],
             )?;
-            result.push(out);
+            result.push(r1);
+            result.push(r2);
         }
         Ok(result.try_into().unwrap())
     }
@@ -967,44 +957,6 @@ impl<F: PrimeField> Blake2bChip<F> {
                 }
 
                 Ok(bytes_out.try_into().unwrap())
-            },
-        )
-    }
-
-    /// 64-bit modular addition: (x + y) mod 2^64.
-    ///
-    /// Carry is detected by checking byte index 8 of the field sum.
-    fn add_mod_u64(
-        &self,
-        mut layouter: impl Layouter<F>,
-        x: &AssignedCell<F, F>,
-        y: &AssignedCell<F, F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
-        layouter.assign_region(
-            || "64-bit word add",
-            |mut region| {
-                self.config.s_word_add.enable(&mut region, 0)?;
-                x.copy_advice(|| "word_add x", &mut region, self.config.advices[A0], 0)?;
-                y.copy_advice(|| "word_add y", &mut region, self.config.advices[A1], 0)?;
-                let sum = x.value().zip(y.value()).map(|(&x, &y)| {
-                    let sum = x + y;
-                    let carry = F::from(sum.to_repr().as_ref()[8] as u64);
-                    let ret = sum - carry * F::from_u128(1u128 << 64);
-                    (ret, carry)
-                });
-                let ret = region.assign_advice(
-                    || "word_add ret",
-                    self.config.advices[A0],
-                    1,
-                    || sum.map(|sum| sum.0),
-                )?;
-                region.assign_advice(
-                    || "word_add carry",
-                    self.config.advices[A1],
-                    1,
-                    || sum.map(|sum| sum.1),
-                )?;
-                Ok(ret)
             },
         )
     }
@@ -1268,27 +1220,6 @@ impl<F: PrimeField> Blake2bChip<F> {
         )
     }
 
-    /// Decompose a 64-bit word into 8 bytes (constrains via s_word_decompose).
-    fn word_decompose(
-        &self,
-        mut layouter: impl Layouter<F>,
-        bytes: &[AssignedCell<F, F>],
-        word: &AssignedCell<F, F>,
-    ) -> Result<(), Error> {
-        assert_eq!(bytes.len(), 8);
-        layouter.assign_region(
-            || "decompose 64-bit word to bytes",
-            |mut region| {
-                self.config.s_word_decompose.enable(&mut region, 0)?;
-                for (i, byte) in bytes.iter().enumerate() {
-                    byte.copy_advice(|| "byte", &mut region, self.config.advices[i], 0)?;
-                }
-                word.copy_advice(|| "word", &mut region, self.config.advices[A0], 1)?;
-                Ok(())
-            },
-        )
-    }
-
     /// Decompose a 32-bit word into 4 bytes using the 8-byte word gate with upper bytes zeroed.
     fn word_decompose_32(
         &self,
@@ -1383,6 +1314,19 @@ impl<F: PrimeField> Blake2bChip<F> {
                 Ok(())
             },
         )
+    }
+
+    /// Read a u64 word from instance and decompose into bytes with range check.
+    ///
+    /// The `word_cell` should already be constrained to an instance cell via
+    /// `layouter.constrain_instance()`. Decomposes into 8 bytes using
+    /// `s_word_decompose` and range-checks via `q_range_check_8`. Uses 2 rows.
+    pub fn word_from_instance(
+        &self,
+        layouter: impl Layouter<F>,
+        word_cell: &AssignedCell<F, F>,
+    ) -> Result<Blake2bWord<F>, Error> {
+        Blake2bWord::from_word(self, layouter, word_cell.clone())
     }
 
     // ---- Field element to BLAKE2b words ----
@@ -1507,129 +1451,118 @@ impl<F: PrimeField> Blake2bChip<F> {
 
     // ---- Public API (hashing) ----
 
-    /// Hash exactly 2 compact actions (296 bytes) per ZIP-244 `hashOrchardActions`.
+    /// Hash with precomputed block 1 state.
     ///
-    /// Input layout per action (148 bytes):
-    ///   nf(32B) || cmx(32B) || epk(32B) || enc_prefix(52B)
+    /// `h_1 = compress(h_init_personalized, block1, 128, false)` — computed outside
+    /// the circuit by the verifier. The circuit starts from h_1 and processes only
+    /// blocks 2 and 3, eliminating one full compression call (4,800 rows).
     ///
-    /// Total: 296 bytes → 37 x 64-bit words → 3 compression blocks.
+    /// Instance layout: `[h_1[0..8], hash_output[0..2]]` (10 values total).
     ///
-    /// Since 148 is not a multiple of 8, word 18 spans the boundary between
-    /// action 1 and action 2. This function works at the byte level: it extracts
-    /// bytes from field-to-words conversions, range-checks raw byte inputs, concatenates
-    /// all 296 bytes, and packs them into words.
-    pub fn process_compact_action_hash(
+    /// Soundness: the verifier independently computes h_1 from public action data
+    /// and passes it as public input. If the prover uses wrong h_1, the proof
+    /// won't verify against the verifier's expected instance values.
+    pub fn process_precomputed_action_hash(
         &self,
         layouter: &mut impl Layouter<F>,
-        action_1: &CompactActionCells<F>,
+        h_1: &[Blake2bWord<F>; 8],
+        enc_1_tail: &[AssignedCell<F, F>; 20],
         action_2: &CompactActionCells<F>,
-        personalization: &[u8; 16],
     ) -> Result<Vec<Blake2bWord<F>>, Error> {
         // Load lookup tables
         Blake2bChip::load_tables(&self.config, layouter)?;
 
-        // Initialize BLAKE2b state
-        let mut h = vec![
-            Blake2bWord::from_constant_u64_unchecked(IV[0] ^ 0x01010000 ^ 32, layouter, &self.config)?,
-            Blake2bWord::from_constant_u64_unchecked(IV[1], layouter, &self.config)?,
-            Blake2bWord::from_constant_u64_unchecked(IV[2], layouter, &self.config)?,
-            Blake2bWord::from_constant_u64_unchecked(IV[3], layouter, &self.config)?,
-            Blake2bWord::from_constant_u64_unchecked(IV[4], layouter, &self.config)?,
-            Blake2bWord::from_constant_u64_unchecked(IV[5], layouter, &self.config)?,
-            Blake2bWord::from_constant_u64_unchecked(
-                IV[6] ^ LittleEndian::read_u64(&personalization[0..8]),
-                layouter,
-                &self.config,
-            )?,
-            Blake2bWord::from_constant_u64_unchecked(
-                IV[7] ^ LittleEndian::read_u64(&personalization[8..16]),
-                layouter,
-                &self.config,
-            )?,
-        ];
+        // Initialize state from precomputed h_1
+        let mut h: Vec<Blake2bWord<F>> = h_1.to_vec();
 
-        // Gather all 296 bytes from both actions in message order
-        let mut all_bytes: Vec<AssignedCell<F, F>> = Vec::with_capacity(296);
+        // Gather remaining bytes (168 = 20 + 148)
+        let mut remaining_bytes: Vec<AssignedCell<F, F>> = Vec::with_capacity(168);
 
-        for (action_idx, action) in [action_1, action_2].iter().enumerate() {
-            // Convert nf field element to BLAKE2b words
-            let nf_words = self.field_to_words(
-                &mut layouter.namespace(|| format!("nf_to_words_{}", action_idx)),
-                &action.nf,
-            )?;
-            for w in &nf_words {
-                all_bytes.extend_from_slice(w.get_bytes());
-            }
+        // enc_1_tail: 20 bytes (enc_1[32..52]), range-check in 3 batches
+        self.range_check_bytes(
+            layouter.namespace(|| "enc1t_range_0"),
+            &enc_1_tail[0..8],
+        )?;
+        self.range_check_bytes(
+            layouter.namespace(|| "enc1t_range_1"),
+            &enc_1_tail[8..16],
+        )?;
+        self.range_check_bytes(
+            layouter.namespace(|| "enc1t_range_2"),
+            &enc_1_tail[16..20],
+        )?;
+        remaining_bytes.extend_from_slice(enc_1_tail);
 
-            // Convert cmx field element to BLAKE2b words
-            let cmx_words = self.field_to_words(
-                &mut layouter.namespace(|| format!("cmx_to_words_{}", action_idx)),
-                &action.cmx,
-            )?;
-            for w in &cmx_words {
-                all_bytes.extend_from_slice(w.get_bytes());
-            }
-
-            // Range-check and append epk bytes (32 bytes = 4 batches of 8)
-            for chunk_idx in 0..4 {
-                self.range_check_bytes(
-                    layouter.namespace(|| format!("epk_range_{}_{}", action_idx, chunk_idx)),
-                    &action.epk_bytes[chunk_idx * 8..(chunk_idx + 1) * 8],
-                )?;
-            }
-            all_bytes.extend_from_slice(&action.epk_bytes);
-
-            // Range-check and append enc bytes (52 bytes = 6 batches of 8 + 1 batch of 4)
-            for chunk_idx in 0..6 {
-                self.range_check_bytes(
-                    layouter.namespace(|| format!("enc_range_{}_{}", action_idx, chunk_idx)),
-                    &action.enc_prefix[chunk_idx * 8..(chunk_idx + 1) * 8],
-                )?;
-            }
-            self.range_check_bytes(
-                layouter.namespace(|| format!("enc_range_{}_last", action_idx)),
-                &action.enc_prefix[48..52],
-            )?;
-            all_bytes.extend_from_slice(&action.enc_prefix);
+        // nf_2: field -> 4 words -> 32 bytes
+        let nf_2_words = self.field_to_words(
+            &mut layouter.namespace(|| "nf2_to_words"),
+            &action_2.nf,
+        )?;
+        for w in &nf_2_words {
+            remaining_bytes.extend_from_slice(w.get_bytes());
         }
 
-        assert_eq!(all_bytes.len(), 296);
+        // cmx_2: field -> 4 words -> 32 bytes
+        let cmx_2_words = self.field_to_words(
+            &mut layouter.namespace(|| "cmx2_to_words"),
+            &action_2.cmx,
+        )?;
+        for w in &cmx_2_words {
+            remaining_bytes.extend_from_slice(w.get_bytes());
+        }
 
-        // Pack 296 bytes into 37 x 64-bit words
-        let mut all_words: Vec<Blake2bWord<F>> = Vec::with_capacity(37);
-        for (i, chunk) in all_bytes.chunks(8).enumerate() {
+        // epk_2: range-check 32 bytes (4 batches of 8)
+        for chunk_idx in 0..4 {
+            self.range_check_bytes(
+                layouter.namespace(|| format!("epk2_range_{}", chunk_idx)),
+                &action_2.epk_bytes[chunk_idx * 8..(chunk_idx + 1) * 8],
+            )?;
+        }
+        remaining_bytes.extend_from_slice(&action_2.epk_bytes);
+
+        // enc_2: range-check 52 bytes (6 batches of 8 + 1 batch of 4)
+        for chunk_idx in 0..6 {
+            self.range_check_bytes(
+                layouter.namespace(|| format!("enc2_range_{}", chunk_idx)),
+                &action_2.enc_prefix[chunk_idx * 8..(chunk_idx + 1) * 8],
+            )?;
+        }
+        self.range_check_bytes(
+            layouter.namespace(|| "enc2_range_last"),
+            &action_2.enc_prefix[48..52],
+        )?;
+        remaining_bytes.extend_from_slice(&action_2.enc_prefix);
+
+        assert_eq!(remaining_bytes.len(), 168);
+
+        // Pack 168 bytes into 21 words
+        let mut remaining_words: Vec<Blake2bWord<F>> = Vec::with_capacity(21);
+        for (i, chunk) in remaining_bytes.chunks(8).enumerate() {
             let word_bytes: [AssignedCell<F, F>; 8] = chunk.to_vec().try_into().unwrap();
             let word = Blake2bWord::from_bytes_unchecked(
                 self,
-                layouter.namespace(|| format!("pack_word_{}", i)),
+                layouter.namespace(|| format!("pack_rem_{}", i)),
                 word_bytes,
             )?;
-            all_words.push(word);
+            remaining_words.push(word);
         }
 
-        // Pad into 3 blocks of 16 words (37 + 11 zeros = 48)
-        let mut blocks = Vec::with_capacity(3);
-        for block_words in all_words.chunks(16) {
-            let mut cur_block = block_words.to_vec();
-            while cur_block.len() < 16 {
-                cur_block.push(Blake2bWord::from_constant_u64_unchecked(
-                    0, layouter, &self.config,
-                )?);
-            }
-            blocks.push(cur_block);
+        // Block 2: words 0..16 (128 bytes)
+        let block_2: Vec<Blake2bWord<F>> = remaining_words[..16].to_vec();
+
+        // Block 3: words 16..21 (40 bytes) + 11 zero-pad words (88 bytes)
+        let mut block_3: Vec<Blake2bWord<F>> = remaining_words[16..].to_vec();
+        while block_3.len() < 16 {
+            block_3.push(Blake2bWord::from_constant_u64_unchecked(
+                0, layouter, &self.config,
+            )?);
         }
 
-        // Compress 3 blocks: t=128, t=256, t=296
-        let num_blocks = blocks.len();
-        for (block_idx, block) in blocks.into_iter().enumerate() {
-            let is_last = block_idx == num_blocks - 1;
-            let bytes_so_far = if is_last {
-                296u128
-            } else {
-                ((block_idx + 1) * 128) as u128
-            };
-            self.compress(layouter, &mut h, &block, bytes_so_far, is_last)?;
-        }
+        // Compress block 2: t=256 (bytes 128-255), not last
+        self.compress(layouter, &mut h, &block_2, 256u128, false)?;
+
+        // Compress block 3: t=296 (total input bytes), last
+        self.compress(layouter, &mut h, &block_3, 296u128, true)?;
 
         Ok(h[..4].to_vec())
     }
@@ -1787,21 +1720,21 @@ impl<F: PrimeField> Blake2bChip<F> {
     /// four words indexed by "a", "b", "c", and "d" in the working vector
     /// v[0..15].
     ///
-    /// Optimized to 50 rows (down from 63) using fused gates:
+    /// Uses fused gates and dual byte XOR (34 rows per G):
     ///   1. single_row_add(v[a], v[b])             — 1 row
     ///   2. fused_add_decompose(sum, x)             — 2 rows
-    ///   3. word_xor(v[d], v[a]) + rotate R1        — 8 rows
+    ///   3. word_xor(v[d], v[a]) + rotate R1        — 4 rows
     ///   4. pack_add_decompose(d_bytes, v[c])       — 2 rows
-    ///   5. word_xor(v[b], v[c]) + rotate R2        — 8 rows
+    ///   5. word_xor(v[b], v[c]) + rotate R2        — 4 rows
     ///   6. pack_add(b_bytes, v[a])                  — 2 rows
     ///   7. fused_add_decompose(sum, y)             — 2 rows
-    ///   8. word_xor(d_bytes, v[a]) + rotate R3     — 8 rows
+    ///   8. word_xor(d_bytes, v[a]) + rotate R3     — 4 rows
     ///   9. pack_add_decompose(d_bytes2, v[c])      — 2 rows
-    ///  10. word_xor(b_bytes, v[c])                  — 8 rows
+    ///  10. word_xor(b_bytes, v[c])                  — 4 rows
     ///  11. left_rotate_1 (R4=63)                   — 3 rows
     ///  12. from_bytes_unchecked (v[b])              — 2 rows
     ///  13. from_bytes_unchecked (v[d])              — 2 rows
-    ///                                        Total: 50 rows
+    ///                                        Total: 34 rows
     fn g(
         &self,
         mut layouter: impl Layouter<F>,
@@ -1899,4 +1832,85 @@ impl<F: PrimeField> Blake2bChip<F> {
 
         Ok(())
     }
+}
+
+// ---- Reference (non-circuit) BLAKE2b helpers ----
+
+fn g_ref(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+    v[d] = (v[d] ^ v[a]).rotate_right(32);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(24);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(63);
+}
+
+fn compress_ref(h: &mut [u64; 8], m: &[u64; 16], t: u128, f: bool) {
+    let mut v = [0u64; 16];
+    v[..8].copy_from_slice(h);
+    v[8..12].copy_from_slice(&IV[0..4]);
+    v[12] = IV[4] ^ (t as u64);
+    v[13] = IV[5] ^ ((t >> 64) as u64);
+    v[14] = if f { IV[6] ^ u64::MAX } else { IV[6] };
+    v[15] = IV[7];
+
+    for i in 0..12 {
+        let s = &SIGMA[i % 10];
+        g_ref(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+        g_ref(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+        g_ref(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+        g_ref(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+        g_ref(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+        g_ref(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        g_ref(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+        g_ref(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+    }
+
+    for i in 0..8 {
+        h[i] = h[i] ^ v[i] ^ v[i + 8];
+    }
+}
+
+/// Compute the intermediate BLAKE2b state after compressing block 1.
+///
+/// Returns `h_1 = compress(h_init, block1, 128, false)` where block 1 is the
+/// first 128 bytes of action 1: `nf(32) + cmx(32) + epk(32) + enc[0..32]`.
+///
+/// The verifier calls this to produce the `h_1` public input for the
+/// precomputed circuit. This is a plain (non-circuit) BLAKE2b compress.
+pub fn compute_h1(
+    nf: &[u8; 32],
+    cmx: &[u8; 32],
+    epk: &[u8; 32],
+    enc: &[u8; 52],
+    personalization: &[u8; 16],
+) -> [u64; 8] {
+    let p0 = u64::from_le_bytes(personalization[0..8].try_into().unwrap());
+    let p1 = u64::from_le_bytes(personalization[8..16].try_into().unwrap());
+    let mut h = [
+        IV[0] ^ 0x01010000 ^ 32,
+        IV[1],
+        IV[2],
+        IV[3],
+        IV[4],
+        IV[5],
+        IV[6] ^ p0,
+        IV[7] ^ p1,
+    ];
+
+    let mut block1 = [0u8; 128];
+    block1[0..32].copy_from_slice(nf);
+    block1[32..64].copy_from_slice(cmx);
+    block1[64..96].copy_from_slice(epk);
+    block1[96..128].copy_from_slice(&enc[0..32]);
+
+    let mut m = [0u64; 16];
+    for (i, word_bytes) in block1.chunks(8).enumerate() {
+        m[i] = u64::from_le_bytes(word_bytes.try_into().unwrap());
+    }
+
+    compress_ref(&mut h, &m, 128, false);
+    h
 }

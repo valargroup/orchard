@@ -2,14 +2,14 @@
 
 #![cfg(feature = "circuit")]
 
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use halo2_proofs::{
     circuit::{floor_planner, Layouter, Value},
     dev::MockProver,
     plonk::{Circuit, Column, ConstraintSystem, Error, Instance},
 };
 use orchard::circuit::blake2b::{
-    assign_free_advice, Blake2bChip, Blake2bConfig, CompactActionCells,
+    assign_free_advice, compute_h1, Blake2bChip, Blake2bConfig, Blake2bWord, CompactActionCells,
 };
 use pasta_curves::pallas;
 
@@ -68,293 +68,14 @@ mod compact_test_data {
     ];
 }
 
-/// Reference BLAKE2b implementation for testing.
-mod reference {
-    use byteorder::{ByteOrder, LittleEndian};
 
-    const IV: [u64; 8] = [
-        0x6a09e667f3bcc908,
-        0xbb67ae8584caa73b,
-        0x3c6ef372fe94f82b,
-        0xa54ff53a5f1d36f1,
-        0x510e527fade682d1,
-        0x9b05688c2b3e6c1f,
-        0x1f83d9abfb41bd6b,
-        0x5be0cd19137e2179,
-    ];
-
-    const SIGMA: [[usize; 16]; 10] = [
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-        [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
-        [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
-        [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
-        [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
-        [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
-        [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
-        [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
-        [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
-    ];
-
-    fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
-        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
-        v[d] = (v[d] ^ v[a]).rotate_right(32);
-        v[c] = v[c].wrapping_add(v[d]);
-        v[b] = (v[b] ^ v[c]).rotate_right(24);
-        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
-        v[d] = (v[d] ^ v[a]).rotate_right(16);
-        v[c] = v[c].wrapping_add(v[d]);
-        v[b] = (v[b] ^ v[c]).rotate_right(63);
-    }
-
-    fn compress(h: &mut [u64; 8], m: &[u64; 16], t: u128, f: bool) {
-        let mut v = [0u64; 16];
-        v[..8].copy_from_slice(h);
-        v[8..12].copy_from_slice(&IV[0..4]);
-        v[12] = IV[4] ^ (t as u64);
-        v[13] = IV[5] ^ ((t >> 64) as u64);
-        v[14] = if f { IV[6] ^ u64::MAX } else { IV[6] };
-        v[15] = IV[7];
-
-        for i in 0..12 {
-            let s = &SIGMA[i % 10];
-            g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
-            g(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
-            g(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
-            g(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
-            g(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
-            g(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
-            g(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
-            g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
-        }
-
-        for i in 0..8 {
-            h[i] = h[i] ^ v[i] ^ v[i + 8];
-        }
-    }
-
-    /// Compute BLAKE2b-256 hash from raw input bytes with personalization.
-    pub fn blake2b_hash(input: &[u8], personalization: &[u8; 16]) -> [u64; 4] {
-        let mut h = [
-            IV[0] ^ 0x01010000 ^ 32,
-            IV[1],
-            IV[2],
-            IV[3],
-            IV[4],
-            IV[5],
-            IV[6] ^ LittleEndian::read_u64(&personalization[0..8]),
-            IV[7] ^ LittleEndian::read_u64(&personalization[8..16]),
-        ];
-
-        let total_input_bytes = input.len();
-
-        // Pad to multiple of 128 bytes (BLAKE2b block size)
-        let mut all_bytes = input.to_vec();
-        if all_bytes.is_empty() {
-            all_bytes.resize(128, 0);
-        } else if all_bytes.len() % 128 != 0 {
-            let padding = 128 - (all_bytes.len() % 128);
-            all_bytes.resize(all_bytes.len() + padding, 0);
-        }
-
-        let num_blocks = all_bytes.len() / 128;
-
-        for (block_idx, chunk) in all_bytes.chunks(128).enumerate() {
-            let mut m = [0u64; 16];
-            for (i, word_bytes) in chunk.chunks(8).enumerate() {
-                m[i] = LittleEndian::read_u64(word_bytes);
-            }
-
-            let is_last = block_idx == num_blocks - 1;
-            let t = if is_last {
-                total_input_bytes as u128
-            } else {
-                ((block_idx + 1) * 128) as u128
-            };
-            compress(&mut h, &m, t, is_last);
-        }
-
-        [h[0], h[1], h[2], h[3]]
-    }
-}
-
-// ---- Shared circuit definition for two-action tests ----
-
-/// Circuit hashing 2 compact actions via `process_compact_action_hash`.
-struct TwoActionHashCircuit {
-    nf_1: Value<pallas::Base>,
-    cmx_1: Value<pallas::Base>,
-    epk_1: Value<[u8; 32]>,
-    enc_1: Value<[u8; 52]>,
-    nf_2: Value<pallas::Base>,
-    cmx_2: Value<pallas::Base>,
-    epk_2: Value<[u8; 32]>,
-    enc_2: Value<[u8; 52]>,
-    personalization: [u8; 16],
-}
-
-#[derive(Clone)]
-struct TwoActionConfig {
-    blake2b_config: Blake2bConfig<pallas::Base>,
-    instance: Column<Instance>,
-}
-
-impl Circuit<pallas::Base> for TwoActionHashCircuit {
-    type Config = TwoActionConfig;
-    type FloorPlanner = floor_planner::V1;
-
-    fn without_witnesses(&self) -> Self {
-        Self {
-            nf_1: Value::unknown(),
-            cmx_1: Value::unknown(),
-            epk_1: Value::unknown(),
-            enc_1: Value::unknown(),
-            nf_2: Value::unknown(),
-            cmx_2: Value::unknown(),
-            epk_2: Value::unknown(),
-            enc_2: Value::unknown(),
-            personalization: self.personalization,
-        }
-    }
-
-    fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
-        let advices = [
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        ];
-
-        for advice in advices.iter() {
-            meta.enable_equality(*advice);
-        }
-
-        let instance = meta.instance_column();
-        meta.enable_equality(instance);
-
-        let constants = meta.fixed_column();
-        meta.enable_constant(constants);
-
-        TwoActionConfig {
-            blake2b_config: Blake2bConfig::configure(meta, advices),
-            instance,
-        }
-    }
-
-    fn synthesize(
-        &self,
-        config: Self::Config,
-        mut layouter: impl Layouter<pallas::Base>,
-    ) -> Result<(), Error> {
-        fn assign_bytes(
-            layouter: &mut impl Layouter<pallas::Base>,
-            col: halo2_proofs::plonk::Column<halo2_proofs::plonk::Advice>,
-            prefix: &str,
-            byte_vals: Value<&[u8]>,
-            count: usize,
-        ) -> Result<Vec<halo2_proofs::circuit::AssignedCell<pallas::Base, pallas::Base>>, Error>
-        {
-            let mut cells = Vec::with_capacity(count);
-            for i in 0..count {
-                let val = byte_vals.map(|bytes| pallas::Base::from(bytes[i] as u64));
-                cells.push(assign_free_advice(
-                    layouter.namespace(|| format!("{}_{}", prefix, i)),
-                    col,
-                    val,
-                )?);
-            }
-            Ok(cells)
-        }
-
-        let col = config.blake2b_config.advices[0];
-
-        // Action 1
-        let nf_1 = assign_free_advice(layouter.namespace(|| "nf_1"), col, self.nf_1)?;
-        let cmx_1 = assign_free_advice(layouter.namespace(|| "cmx_1"), col, self.cmx_1)?;
-        let epk_1_cells = assign_bytes(
-            &mut layouter, col, "epk_1",
-            self.epk_1.as_ref().map(|b| b.as_ref()), 32,
-        )?;
-        let enc_1_cells = assign_bytes(
-            &mut layouter, col, "enc_1",
-            self.enc_1.as_ref().map(|b| b.as_ref()), 52,
-        )?;
-
-        // Action 2
-        let nf_2 = assign_free_advice(layouter.namespace(|| "nf_2"), col, self.nf_2)?;
-        let cmx_2 = assign_free_advice(layouter.namespace(|| "cmx_2"), col, self.cmx_2)?;
-        let epk_2_cells = assign_bytes(
-            &mut layouter, col, "epk_2",
-            self.epk_2.as_ref().map(|b| b.as_ref()), 32,
-        )?;
-        let enc_2_cells = assign_bytes(
-            &mut layouter, col, "enc_2",
-            self.enc_2.as_ref().map(|b| b.as_ref()), 52,
-        )?;
-
-        let action_1 = CompactActionCells {
-            nf: nf_1,
-            cmx: cmx_1,
-            epk_bytes: epk_1_cells.try_into().unwrap(),
-            enc_prefix: enc_1_cells.try_into().unwrap(),
-        };
-
-        let action_2 = CompactActionCells {
-            nf: nf_2,
-            cmx: cmx_2,
-            epk_bytes: epk_2_cells.try_into().unwrap(),
-            enc_prefix: enc_2_cells.try_into().unwrap(),
-        };
-
-        let blake2b_chip = Blake2bChip::construct(config.blake2b_config.clone());
-        let result = blake2b_chip.process_compact_action_hash(
-            &mut layouter,
-            &action_1,
-            &action_2,
-            &self.personalization,
-        )?;
-
-        let encoded = blake2b_chip.encode_result(&mut layouter, &result)?;
-        for (i, field) in encoded.iter().enumerate() {
-            layouter.constrain_instance(field.cell(), config.instance, i)?;
-        }
-
-        Ok(())
-    }
-}
-
-// ---- Helper to build circuit and expected hash from raw action bytes ----
+// ---- Helpers ----
 
 struct ActionData {
     nf: [u8; 32],
     cmx: [u8; 32],
     epk: [u8; 32],
     enc: [u8; 52],
-}
-
-fn build_circuit(a1: &ActionData, a2: &ActionData, personalization: &[u8; 16]) -> TwoActionHashCircuit {
-    let nf_1 = pallas::Base::from_repr(a1.nf).expect("valid field element");
-    let cmx_1 = pallas::Base::from_repr(a1.cmx).expect("valid field element");
-    let nf_2 = pallas::Base::from_repr(a2.nf).expect("valid field element");
-    let cmx_2 = pallas::Base::from_repr(a2.cmx).expect("valid field element");
-
-    TwoActionHashCircuit {
-        nf_1: Value::known(nf_1),
-        cmx_1: Value::known(cmx_1),
-        epk_1: Value::known(a1.epk),
-        enc_1: Value::known(a1.enc),
-        nf_2: Value::known(nf_2),
-        cmx_2: Value::known(cmx_2),
-        epk_2: Value::known(a2.epk),
-        enc_2: Value::known(a2.enc),
-        personalization: *personalization,
-    }
 }
 
 fn expected_hash_from_blake2b_simd(a1: &ActionData, a2: &ActionData, personalization: &[u8; 16]) -> Vec<pallas::Base> {
@@ -382,81 +103,382 @@ fn expected_hash_from_blake2b_simd(a1: &ActionData, a2: &ActionData, personaliza
         .collect()
 }
 
-// ---- Tests ----
+// ---- Circuit definition ----
 
-/// Test that the circuit matches our reference BLAKE2b implementation.
+/// Circuit with precomputed block 1 state (h_1).
+///
+/// Instance layout: `[h_1[0..8], hash_output[0..2]]` (10 values total).
+/// - instance[0..8]: h_1 as 8 raw u64 words (each a field element)
+/// - instance[8..10]: hash output as 2 × 128-bit packed fields
+struct PrecomputedCircuit {
+    h_1_words: [Value<pallas::Base>; 8],
+    enc_1_tail: Value<[u8; 20]>,
+    nf_2: Value<pallas::Base>,
+    cmx_2: Value<pallas::Base>,
+    epk_2: Value<[u8; 32]>,
+    enc_2: Value<[u8; 52]>,
+}
+
+#[derive(Clone)]
+struct PrecomputedConfig {
+    blake2b_config: Blake2bConfig<pallas::Base>,
+    instance: Column<Instance>,
+}
+
+impl Circuit<pallas::Base> for PrecomputedCircuit {
+    type Config = PrecomputedConfig;
+    type FloorPlanner = floor_planner::V1;
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            h_1_words: [
+                Value::unknown(), Value::unknown(), Value::unknown(), Value::unknown(),
+                Value::unknown(), Value::unknown(), Value::unknown(), Value::unknown(),
+            ],
+            enc_1_tail: Value::unknown(),
+            nf_2: Value::unknown(),
+            cmx_2: Value::unknown(),
+            epk_2: Value::unknown(),
+            enc_2: Value::unknown(),
+        }
+    }
+
+    fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
+        let advices: [_; 18] = core::array::from_fn(|_| meta.advice_column());
+
+        for advice in advices.iter() {
+            meta.enable_equality(*advice);
+        }
+
+        let instance = meta.instance_column();
+        meta.enable_equality(instance);
+
+        let constants = meta.fixed_column();
+        meta.enable_constant(constants);
+
+        PrecomputedConfig {
+            blake2b_config: Blake2bConfig::configure(meta, advices),
+            instance,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<pallas::Base>,
+    ) -> Result<(), Error> {
+        let col = config.blake2b_config.advices[0];
+        let chip = Blake2bChip::construct(config.blake2b_config.clone());
+
+        // Copy h_1 from instance: assign advice, constrain to instance, decompose
+        let mut h_1_vec: Vec<Blake2bWord<pallas::Base>> = Vec::with_capacity(8);
+        for i in 0..8 {
+            let word_cell = assign_free_advice(
+                layouter.namespace(|| format!("h1_{}", i)),
+                col,
+                self.h_1_words[i],
+            )?;
+            layouter.constrain_instance(word_cell.cell(), config.instance, i)?;
+            let word = chip.word_from_instance(
+                layouter.namespace(|| format!("h1_decomp_{}", i)),
+                &word_cell,
+            )?;
+            h_1_vec.push(word);
+        }
+        let h_1: [Blake2bWord<pallas::Base>; 8] = h_1_vec.try_into().unwrap();
+
+        // Assign enc_1_tail (20 bytes)
+        let mut enc_1_tail_cells = Vec::with_capacity(20);
+        for i in 0..20 {
+            let val = self.enc_1_tail.map(|bytes| pallas::Base::from(bytes[i] as u64));
+            enc_1_tail_cells.push(assign_free_advice(
+                layouter.namespace(|| format!("enc1t_{}", i)),
+                col,
+                val,
+            )?);
+        }
+        let enc_1_tail: [halo2_proofs::circuit::AssignedCell<pallas::Base, pallas::Base>; 20] =
+            enc_1_tail_cells.try_into().unwrap();
+
+        // Assign action_2
+        let nf_2 = assign_free_advice(layouter.namespace(|| "nf_2"), col, self.nf_2)?;
+        let cmx_2 = assign_free_advice(layouter.namespace(|| "cmx_2"), col, self.cmx_2)?;
+
+        fn assign_bytes(
+            layouter: &mut impl Layouter<pallas::Base>,
+            col: halo2_proofs::plonk::Column<halo2_proofs::plonk::Advice>,
+            prefix: &str,
+            byte_vals: Value<&[u8]>,
+            count: usize,
+        ) -> Result<Vec<halo2_proofs::circuit::AssignedCell<pallas::Base, pallas::Base>>, Error>
+        {
+            let mut cells = Vec::with_capacity(count);
+            for i in 0..count {
+                let val = byte_vals.map(|bytes| pallas::Base::from(bytes[i] as u64));
+                cells.push(assign_free_advice(
+                    layouter.namespace(|| format!("{}_{}", prefix, i)),
+                    col,
+                    val,
+                )?);
+            }
+            Ok(cells)
+        }
+
+        let epk_2_cells = assign_bytes(
+            &mut layouter, col, "epk_2",
+            self.epk_2.as_ref().map(|b| b.as_ref()), 32,
+        )?;
+        let enc_2_cells = assign_bytes(
+            &mut layouter, col, "enc_2",
+            self.enc_2.as_ref().map(|b| b.as_ref()), 52,
+        )?;
+
+        let action_2 = CompactActionCells {
+            nf: nf_2,
+            cmx: cmx_2,
+            epk_bytes: epk_2_cells.try_into().unwrap(),
+            enc_prefix: enc_2_cells.try_into().unwrap(),
+        };
+
+        let result = chip.process_precomputed_action_hash(
+            &mut layouter,
+            &h_1,
+            &enc_1_tail,
+            &action_2,
+        )?;
+
+        let encoded = chip.encode_result(&mut layouter, &result)?;
+        for (i, field) in encoded.iter().enumerate() {
+            layouter.constrain_instance(field.cell(), config.instance, 8 + i)?;
+        }
+
+        Ok(())
+    }
+}
+
+// ---- Test helpers ----
+
+/// Build a PrecomputedCircuit and instance vector from two actions.
+/// The circuit witness uses `a2_witness` data while the instance hash is computed from `a2_instance`.
+/// For positive tests, pass the same ActionData for both.
+fn build_test(
+    a1: &ActionData,
+    a2_instance: &ActionData,
+    a2_witness: &ActionData,
+    personalization: &[u8; 16],
+) -> (PrecomputedCircuit, Vec<pallas::Base>) {
+    let h_1 = compute_h1(&a1.nf, &a1.cmx, &a1.epk, &a1.enc, personalization);
+
+    let mut instance: Vec<pallas::Base> = Vec::with_capacity(10);
+    for &word in &h_1 {
+        instance.push(pallas::Base::from(word));
+    }
+    let expected_hash_fields = expected_hash_from_blake2b_simd(a1, a2_instance, personalization);
+    instance.extend_from_slice(&expected_hash_fields);
+
+    let mut enc_1_tail = [0u8; 20];
+    enc_1_tail.copy_from_slice(&a1.enc[32..52]);
+
+    let nf_2 = pallas::Base::from_repr(a2_witness.nf).expect("valid field element");
+    let cmx_2 = pallas::Base::from_repr(a2_witness.cmx).expect("valid field element");
+
+    let h_1_words = h_1.map(|w| Value::known(pallas::Base::from(w)));
+
+    let circuit = PrecomputedCircuit {
+        h_1_words,
+        enc_1_tail: Value::known(enc_1_tail),
+        nf_2: Value::known(nf_2),
+        cmx_2: Value::known(cmx_2),
+        epk_2: Value::known(a2_witness.epk),
+        enc_2: Value::known(a2_witness.enc),
+    };
+
+    (circuit, instance)
+}
+
+/// Build and verify a circuit where witness matches instance (positive test).
+fn assert_circuit_verifies(a1: &ActionData, a2: &ActionData, personalization: &[u8; 16], msg: &str) {
+    let (circuit, instance) = build_test(a1, a2, a2, personalization);
+    let prover = MockProver::run(13, &circuit, vec![instance]).unwrap();
+    assert_eq!(prover.verify(), Ok(()), "{}", msg);
+}
+
+/// Generate deterministic action data from a seed byte.
+fn generate_action_data(seed: u8) -> ActionData {
+    let hash = |tag: &[u8]| -> [u8; 32] {
+        let h = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"test_vector_gen!")
+            .to_state()
+            .update(&[seed])
+            .update(tag)
+            .finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.as_bytes()[..32]);
+        out
+    };
+
+    // nf, cmx must be valid field elements: clear MSB to ensure < p
+    let mut nf = hash(b"nf");
+    nf[31] &= 0x3F;
+    let mut cmx = hash(b"cmx");
+    cmx[31] &= 0x3F;
+
+    let epk = hash(b"epk");
+
+    let enc_part1 = hash(b"enc1");
+    let enc_part2 = hash(b"enc2");
+    let mut enc = [0u8; 52];
+    enc[0..32].copy_from_slice(&enc_part1);
+    enc[32..52].copy_from_slice(&enc_part2[0..20]);
+
+    ActionData { nf, cmx, epk, enc }
+}
+
+// ---- Positive tests ----
+
+/// Test precomputed action hash produces same result as full 3-block hash.
 #[test]
-fn test_two_action_against_reference() {
+fn test_precomputed_action_hash() {
     use compact_test_data::*;
 
     let a1 = ActionData { nf: NF_OLD, cmx: CMX, epk: EPHEMERAL_KEY, enc: C_ENC_PREFIX };
     let a2 = ActionData { nf: NF_OLD_2, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
-    let personalization = b"ZTxIdOrcActCHash";
+    assert_circuit_verifies(&a1, &a2, b"ZTxIdOrcActCHash", "original test vectors");
+}
 
-    // Build input bytes in message order
-    let mut input = Vec::with_capacity(296);
-    for a in [&a1, &a2] {
-        input.extend_from_slice(&a.nf);
-        input.extend_from_slice(&a.cmx);
-        input.extend_from_slice(&a.epk);
-        input.extend_from_slice(&a.enc);
-    }
+/// All-zero inputs exercise zero-carry paths and zero-XOR in G.
+#[test]
+fn test_all_zeros() {
+    let a1 = ActionData { nf: [0u8; 32], cmx: [0u8; 32], epk: [0u8; 32], enc: [0u8; 52] };
+    let a2 = ActionData { nf: [0u8; 32], cmx: [0u8; 32], epk: [0u8; 32], enc: [0u8; 52] };
+    assert_circuit_verifies(&a1, &a2, b"ZTxIdOrcActCHash", "all-zero inputs");
+}
 
-    let ref_hash = reference::blake2b_hash(&input, personalization);
-    let expected_words: Vec<pallas::Base> = ref_hash
-        .chunks(2)
-        .map(|pair| {
-            pallas::Base::from(pair[0])
-                + pallas::Base::from(pair[1]) * pallas::Base::from_u128(1u128 << 64)
-        })
-        .collect();
+/// High-value inputs exercise max-carry wrapping_add overflow and all-ones XOR.
+/// nf/cmx use 0x3FFF..FF (largest value with MSB < 0x40), epk/enc are all 0xFF.
+#[test]
+fn test_high_carry_inputs() {
+    let mut high_field = [0xFFu8; 32];
+    high_field[31] = 0x3F; // ensure < p
 
-    let circuit = build_circuit(&a1, &a2, personalization);
+    let a1 = ActionData { nf: high_field, cmx: high_field, epk: [0xFF; 32], enc: [0xFF; 52] };
+    let a2 = ActionData { nf: high_field, cmx: high_field, epk: [0xFF; 32], enc: [0xFF; 52] };
+    assert_circuit_verifies(&a1, &a2, b"ZTxIdOrcActCHash", "high-carry 0xFF inputs");
+}
 
-    let k = 14;
-    let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
-    assert_eq!(
-        prover.verify(),
-        Ok(()),
-        "Circuit output doesn't match reference BLAKE2b"
+/// Deterministic generated vectors provide a third independent input pattern.
+#[test]
+fn test_deterministic_generated_vectors() {
+    let a1 = generate_action_data(0x42);
+    let a2 = generate_action_data(0xAB);
+    assert_circuit_verifies(&a1, &a2, b"ZTxIdOrcActCHash", "deterministic generated vectors");
+}
+
+/// Test with nf_2 = p-1 (largest valid Pallas field element).
+/// Exercises field_to_words decomposition at the field boundary.
+#[test]
+fn test_field_boundary_p_minus_1() {
+    use compact_test_data::*;
+
+    let a1 = ActionData { nf: NF_OLD, cmx: CMX, epk: EPHEMERAL_KEY, enc: C_ENC_PREFIX };
+
+    // Construct p-1 as bytes
+    let neg_one = -pallas::Base::ONE;
+    let repr = neg_one.to_repr();
+    let mut p_minus_1 = [0u8; 32];
+    p_minus_1.copy_from_slice(repr.as_ref());
+
+    // Verify it round-trips
+    assert!(bool::from(pallas::Base::from_repr(p_minus_1).is_some()), "p-1 must be a valid field repr");
+
+    let a2 = ActionData { nf: p_minus_1, cmx: p_minus_1, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
+    assert_circuit_verifies(&a1, &a2, b"ZTxIdOrcActCHash", "nf_2/cmx_2 = p-1 field boundary");
+}
+
+// ---- Negative tests ----
+
+/// Wrong h_1 in instance: flipping a bit in h_1[0] causes instance constraint failure.
+#[test]
+fn test_wrong_h1_rejected() {
+    use compact_test_data::*;
+
+    let a1 = ActionData { nf: NF_OLD, cmx: CMX, epk: EPHEMERAL_KEY, enc: C_ENC_PREFIX };
+    let a2 = ActionData { nf: NF_OLD_2, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
+    let (circuit, mut instance) = build_test(&a1, &a2, &a2, b"ZTxIdOrcActCHash");
+
+    // Flip a bit in h_1[0] instance value (circuit witness still has the correct h_1)
+    instance[0] += pallas::Base::ONE;
+
+    let prover = MockProver::run(13, &circuit, vec![instance]).unwrap();
+    assert!(
+        prover.verify().is_err(),
+        "Wrong h_1 instance should cause constraint failure"
     );
 }
 
-/// Test with zero-filled actions against blake2b_simd.
+/// Wrong hash output in instance: correct h_1 but wrong expected hash.
 #[test]
-fn test_two_action_zeros() {
-    let a1 = ActionData { nf: [0u8; 32], cmx: [0u8; 32], epk: [0u8; 32], enc: [0u8; 52] };
-    let a2 = ActionData { nf: [0u8; 32], cmx: [0u8; 32], epk: [0u8; 32], enc: [0u8; 52] };
-    let personalization = b"ZTxIdOrcActCHash";
-
-    let expected_words = expected_hash_from_blake2b_simd(&a1, &a2, personalization);
-    let circuit = build_circuit(&a1, &a2, personalization);
-
-    let k = 14;
-    let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
-    assert_eq!(prover.verify(), Ok(()), "Two-action zeros test failed");
-}
-
-/// Test with non-trivial test vectors against blake2b_simd.
-///
-/// Uses distinct data for both actions to verify correct interleaving
-/// and the 148-byte action boundary (word 18 spans both actions).
-#[test]
-fn test_two_action_compact_hash() {
+fn test_wrong_hash_output_rejected() {
     use compact_test_data::*;
 
     let a1 = ActionData { nf: NF_OLD, cmx: CMX, epk: EPHEMERAL_KEY, enc: C_ENC_PREFIX };
     let a2 = ActionData { nf: NF_OLD_2, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
-    let personalization = b"ZTxIdOrcActCHash";
+    let (circuit, mut instance) = build_test(&a1, &a2, &a2, b"ZTxIdOrcActCHash");
 
-    let expected_words = expected_hash_from_blake2b_simd(&a1, &a2, personalization);
-    let circuit = build_circuit(&a1, &a2, personalization);
+    // Corrupt the hash output instance (index 8)
+    instance[8] += pallas::Base::ONE;
 
-    let k = 14;
-    let prover = MockProver::run(k, &circuit, vec![expected_words]).unwrap();
-    assert_eq!(
-        prover.verify(),
-        Ok(()),
-        "Two-action compact hash should match blake2b_simd reference"
+    let prover = MockProver::run(13, &circuit, vec![instance]).unwrap();
+    assert!(
+        prover.verify().is_err(),
+        "Wrong hash output instance should cause constraint failure"
+    );
+}
+
+/// Wrong nf_2 witness: instance expects hash(real_nf_2) but circuit witnesses a different nf_2.
+/// The circuit hashes wrong data, producing output that doesn't match instance.
+#[test]
+fn test_wrong_nf2_witness_rejected() {
+    use compact_test_data::*;
+
+    let a1 = ActionData { nf: NF_OLD, cmx: CMX, epk: EPHEMERAL_KEY, enc: C_ENC_PREFIX };
+    let a2_real = ActionData { nf: NF_OLD_2, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
+
+    // Create a2_fake with a different nf
+    let mut fake_nf = NF_OLD_2;
+    fake_nf[0] ^= 0x01; // flip one bit
+    let a2_fake = ActionData { nf: fake_nf, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
+
+    // Instance hash is computed from a2_real, but circuit witness uses a2_fake
+    let (circuit, instance) = build_test(&a1, &a2_real, &a2_fake, b"ZTxIdOrcActCHash");
+
+    let prover = MockProver::run(13, &circuit, vec![instance]).unwrap();
+    assert!(
+        prover.verify().is_err(),
+        "Wrong nf_2 witness should cause hash mismatch and constraint failure"
+    );
+}
+
+/// Flipping a single byte in enc_2 witness causes the hash to change, failing verification.
+#[test]
+fn test_single_byte_flip_detected() {
+    use compact_test_data::*;
+
+    let a1 = ActionData { nf: NF_OLD, cmx: CMX, epk: EPHEMERAL_KEY, enc: C_ENC_PREFIX };
+    let a2_real = ActionData { nf: NF_OLD_2, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: C_ENC_PREFIX_2 };
+
+    // Flip one byte in enc_2
+    let mut flipped_enc = C_ENC_PREFIX_2;
+    flipped_enc[25] ^= 0x80;
+    let a2_flipped = ActionData { nf: NF_OLD_2, cmx: CMX_2, epk: EPHEMERAL_KEY_2, enc: flipped_enc };
+
+    // Instance hash from real data, witness from flipped data
+    let (circuit, instance) = build_test(&a1, &a2_real, &a2_flipped, b"ZTxIdOrcActCHash");
+
+    let prover = MockProver::run(13, &circuit, vec![instance]).unwrap();
+    assert!(
+        prover.verify().is_err(),
+        "Single byte flip in enc_2 should cause constraint failure"
     );
 }

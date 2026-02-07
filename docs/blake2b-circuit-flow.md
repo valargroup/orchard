@@ -39,15 +39,14 @@ Each action contributes 148B. For 2 actions: 296B total.
 
 ### Per-action inputs
 
-- **`nf`** — nullifier — 32B, split into two 16B field elements
-  > `nf_lo` (lower 16B) and `nf_hi` (upper 16B).
-  > Each half trivially fits in the Pallas field (16B << 32B), so no
-  > canonicality check is needed. Range-checked to 16B via byte
-  > decomposition.
+- **`nf`** — nullifier — single Fp field element (32B)
+  > The nullifier is the output of `ExtractP` (x-coordinate extraction),
+  > which is inherently a Pallas base field element. Decomposed into 32
+  > bytes by `field_to_words()` with recomposition check via
+  > `s_result_encode` and `s_field_recompose`.
 
-- **`cmx`** — note commitment — 32B, split into two 16B field elements
-  > `cmx_lo` (lower 16B) and `cmx_hi` (upper 16B).
-  > Same split representation as nf. No canonicality check.
+- **`cmx`** — note commitment — single Fp field element (32B)
+  > Same representation as nf. Both fit in a single Fp.
 
 - **`epk`** — ephemeral public key — 32B (raw)
 
@@ -62,8 +61,6 @@ Each action contributes 148B. For 2 actions: 296B total.
   > Packed by `encode_result()` and exposed as public inputs via
   > `constrain_instance()`.
 
-- **`"ZTxIdOrcActCHash"`** — 16B BLAKE2b personalization (hardcoded)
-
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                         CIRCUIT INPUTS (2 ACTIONS)                   ║
@@ -72,16 +69,14 @@ Each action contributes 148B. For 2 actions: 296B total.
 ║  PRIVATE (auxiliary witness)         PUBLIC INPUTS                   ║
 ║  ┌───────────────────────────┐      ┌──────────────────────────┐     ║
 ║  │ Action 1:                 │      │ Action 1:                │     ║
-║  │   nf_1_lo (Fp, 16B)       │      │   cmx_1_lo (Fp, 16B)     │     ║
-║  │   nf_1_hi (Fp, 16B)       │      │   cmx_1_hi (Fp, 16B)     │     ║
-║  │                           │      │   epk_1    (32B)         │     ║
-║  ├───────────────────────────┤      │   enc_1    (52B)         │     ║
+║  │   nf_1 (Fp)               │      │   cmx_1 (Fp)             │     ║
+║  │                           │      │   epk_1  (32B)           │     ║
+║  ├───────────────────────────┤      │   enc_1  (52B)           │     ║
 ║  │ Action 2:                 │      ├──────────────────────────┤     ║
-║  │   nf_2_lo (Fp, 16B)       │      │ Action 2:                │     ║
-║  │   nf_2_hi (Fp, 16B)       │      │   cmx_2_lo (Fp, 16B)     │     ║
-║  └───────────┬───────────────┘      │   cmx_2_hi (Fp, 16B)     │     ║
-║              │                      │   epk_2    (32B)         │     ║
-║              │                      │   enc_2    (52B)         │     ║
+║  │   nf_2 (Fp)               │      │ Action 2:                │     ║
+║  └───────────┬───────────────┘      │   cmx_2 (Fp)             │     ║
+║              │                      │   epk_2  (32B)           │     ║
+║              │                      │   enc_2  (52B)           │     ║
 ║              │                      ├──────────────────────────┤     ║
 ║              │                      │ expected action_hash     │     ║
 ║              │                      │ 2 field elements         │     ║
@@ -90,40 +85,34 @@ Each action contributes 148B. For 2 actions: 296B total.
                │                               │
                ▼                               ▼
 ╔══════════════════════════════════════════════════════════════════════╗
-║  process_compact_action_hash(action_1, action_2, personalization)    ║
+║  process_compact_action_hash(action_1, action_2)                     ║
 ╚════════════════════════════════╤═════════════════════════════════════╝
                                  │
               ┌──────────────────┼──────────────┐
               ▼                  ▼              ▼
     ┌──────────────┐   ┌─────────────┐   ┌──────────────────┐
     │ field_       │   │ Range-check │   │ Range-check      │
-    │ decompose_   │   │ epk bytes   │   │ enc bytes        │
-    │ split        │   │ (32B each)  │   │ (52B each)       │
-    │ nf (32B),    │   └──────┬──────┘   └─────────┬────────┘
-    │ cmx (32B)    │          │                    │
-    │ per action   │          │                    │
+    │ to_words     │   │ epk bytes   │   │ enc bytes        │
+    │ nf (Fp),     │   │ (32B each)  │   │ (52B each)       │
+    │ cmx (Fp)     │   │ ~8 rows     │   │ ~14 rows         │
+    │ per action   │   └──────┬──────┘   └─────────┬────────┘
+    │              │          │                    │
+    │ ~300 rows    │          │                    │
     └──────┬───────┘          │                    │
            │                  │                    │
            └──────────────────┼────────────────────┘
                               │
                     ┌─────────▼──────────────────┐
-                    │ Concatenate all bytes in   │
-                    │ message order (per action):│
-                    │ nf‖cmx‖epk‖enc = 148B      │
-                    │ × 2 actions = 296B         │
-                    └─────────┬──────────────────┘
-                              │
-                    ┌─────────▼──────────────────┐
-                    │  Pack into 37 x 64-bit     │
+                    │  Pack 296 bytes into 3     │
+                    │  blocks of 16 x 64-bit     │
                     │  words [s_word_decompose]  │
-                    └─────────┬──────────────────┘
-                              │
-                    ┌─────────▼──────────────────┐
-                    │  Block Assembly            │
+                    │                            │
                     │  Block 1: words [0..15]    │
                     │  Block 2: words [16..31]   │
                     │  Block 3: words [32..36]   │
                     │    + 11 zero-pad words     │
+                    │                            │
+                    │  ~74 rows                  │
                     └─────────┬──────────────────┘
                               │
                               ▼
@@ -134,25 +123,19 @@ Each action contributes 148B. For 2 actions: 296B total.
   │  compress(h, block2, t=256, f=false)                     │
   │  compress(h, block3, t=296, f=true)                      │
   │                                                          │
-  │  After final compress, h holds the BLAKE2b hash.         │
+  │  288 G calls × ~63 rows/G ≈ 18,500 rows (dominant)       │
   └──────────────────────────┬───────────────────────────────┘
                              │
                              ▼
              ┌──────────────────────────────────────────┐
-             │ Take h[0..3] (first 4 of 8 words)        │
-             │ = 32B BLAKE2b-256 digest                 │
-             └──────────────────┬───────────────────────┘
-                                │
-                                ▼
-             ┌──────────────────────────────────────────┐
              │ encode_result()                          │
              │                                          │
-             │ Pack 4 words into 2 field elements:      │
-             │   field_0 = word0 + word1 * 2^64         │
-             │   field_1 = word2 + word3 * 2^64         │
+             │ Encode 256-bit digest (h[0..3]) as       │
+             │ 2 field elements [s_result_encode]:      │
+             │   field_0 = h[0] + h[1] * 2^64           │
+             │   field_1 = h[2] + h[3] * 2^64           │
              │                                          │
-             │ [s_result_encode] gate constrains the    │
-             │ packing. 4 words → 2 fields.             │
+             │ 4 rows                                   │
              └──────────────────┬───────────────────────┘
                                 │
                                 ▼
@@ -169,45 +152,42 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
 
 
-## Field Decomposition — nf, cmx (16B halves, no canonicality)
+## Field to Words — nf, cmx (Fp → Blake2bWords)
 
-  Each 32B value (nf, cmx) is 256 bits, which exceeds the Pallas
-  field capacity (~255 bits). So each is split into **two 16B halves**
-  (lo + hi). Since 128 bits << ~255 bits, each half trivially fits
-  in the field — no canonicality check is needed.
+  Each nf and cmx is a Pallas base field element (< q ≈ 2^254).
+  Since both are inherently field elements (nf from `ExtractP`,
+  cmx from `MerkleHashOrchard`), each fits in a single Fp — no
+  splitting into halves is needed.
 
-  **Why this is sound:** In the full Orchard circuit, the nullifier is
-  derived from a Poseidon hash (which outputs an Fp element). The Orchard
-  circuit constrains `nf = nf_lo + nf_hi * 2^128` and knows nf is
-  canonical because it's a constrained Fp output. The Blake2b sub-circuit
-  doesn't need to independently verify canonicality — it just needs the
-  byte decomposition to be correct, which the 16B range checks
-  guarantee.
+  No canonicality check is needed because BLAKE2b itself enforces
+  correctness: non-canonical bytes would produce wrong hashes,
+  causing the circuit to fail verification against the expected
+  public output.
 
-  `field_decompose_split()` pipeline per (lo, hi) pair:
+  `field_to_words()` pipeline per field element:
 
 ```
   ┌──────────────────────────────────────────────────────────┐
-  │ 1. Decompose lo (16B) into 16 individual bytes           │
+  │ 1. Witness 32 bytes from the Fp field element             │
   │    Prover provides byte values as witness. Each byte     │
   │    range-checked to [0,255] via byte_range lookup table  │
   │    (prevents prover from claiming a "byte" is e.g. 300). │
   ├──────────────────────────────────────────────────────────┤
-  │ 2. Pack 16 bytes into 2 x 64-bit words (8 bytes each)    │
-  │    [s_word_decompose] gate constrains:                   │
-  │    word = b0 + b1*2^8 + b2*2^16 + ... + b7*2^56          │
+  │ 2. Pack 32 bytes into 4 x 64-bit words (8 bytes each)    │
+  │    Via 8 x 32-bit words [s_word_decompose] then          │
+  │    4 x word_combine [s_word_combine] to get 64-bit words.│
   │    Produces Blake2bWord structs for compression.         │
   ├──────────────────────────────────────────────────────────┤
-  │ 3. Recomposition check (integrity)                       │
-  │    [s_result_encode] gate (reused):                      │
-  │    lo == word_0 + word_1 * 2^64                          │
-  │    Proves the bytes actually represent the original lo.  │
+  │ 3. Recomposition checks (integrity)                      │
+  │    [s_result_encode] x 2:                                │
+  │      sum_01 = word_0 + word_1 * 2^64                     │
+  │      sum_23 = word_2 + word_3 * 2^64                     │
+  │    [s_field_recompose] x 1:                              │
+  │      field_elem = sum_01 + sum_23 * 2^128                │
+  │    Proves the bytes actually represent the original Fp.  │
   │    Without this, prover could hash wrong data.           │
   ├──────────────────────────────────────────────────────────┤
-  │ 4. Repeat steps 1-3 for hi → 2 more 64-bit words         │
-  ├──────────────────────────────────────────────────────────┤
-  │ Result: 4 x 64-bit Blake2bWords per 32B input value      │
-  │         No canonicality check needed (16B << ~255 bits). │
+  │ Result: 4 x 64-bit Blake2bWords per field element         │
   └──────────────────────────────────────────────────────────┘
 ```
 
@@ -370,6 +350,7 @@ Each action contributes 148B. For 2 actions: 296B total.
   s_word_decompose    word = b1 + b2*2^8 + ... + b8*2^56   1 constraint
   s_word_add          lhs + rhs = out + carry*2^64         2 constraints
   s_result_encode     field = w1 + w2*2^64                 1 constraint
+  s_field_recompose   field = sum_01 + sum_23*2^128        1 constraint
   s_word_combine      w64 = w32_lo + w32_hi*2^32           1 constraint
   s_left_shift_1      2*in + c_in = out + 256*c_out        3 constraints/byte
   q_nibble_xor        byte = lo + hi*16 (decompose)        3 constraints

@@ -3,11 +3,10 @@
 //! Provides a constrained BLAKE2b-256 hash function for use in Orchard compact
 //! action hashes (ZIP-244).
 //!
-//! Field elements are represented as pairs of 16-byte halves (lo, hi), each
-//! trivially fitting in the Pallas field (~32 bytes) without canonicality checks.
-//! Each half is decomposed into bytes, which are range-checked via a lookup table.
-//! Bytes are packed into 64-bit words — BLAKE2b's native word size — via
-//! `word_decompose` and `word_combine` gates.
+//! Field element inputs (nf, cmx) are single Fp values, converted to 32 bytes
+//! each. Bytes are range-checked via a lookup table and packed into 64-bit words
+//! — BLAKE2b's native word size — via `word_decompose` and `word_combine` gates.
+//! Recomposition is verified via `s_result_encode` and `s_field_recompose` gates.
 //!
 //! XOR operations use a 16×16 nibble-level lookup table. Each byte XOR is split
 //! into two nibble XORs (lo and hi halves), with decompose/recompose gates.
@@ -58,23 +57,6 @@ const A9: usize = 9;
 // ----------------
 // Value helpers
 // ----------------
-
-/// Split a field element into two 16-byte halves (lo, hi) for witness preparation.
-///
-/// Each half trivially fits in the Pallas field (~32 bytes), so no canonicality
-/// check is needed. Use this to populate [`CompactActionCells`] from full field
-/// elements.
-pub fn split_field_to_halves<F: PrimeField>(value: F) -> (F, F) {
-    let repr = value.to_repr();
-    let bytes = repr.as_ref();
-    let mut lo_repr = F::Repr::default();
-    lo_repr.as_mut()[..16].copy_from_slice(&bytes[..16]);
-    let mut hi_repr = F::Repr::default();
-    hi_repr.as_mut()[..16].copy_from_slice(&bytes[16..32]);
-    let lo = F::from_repr(lo_repr).unwrap();
-    let hi = F::from_repr(hi_repr).unwrap();
-    (lo, hi)
-}
 
 /// Extract the least-significant byte from a field element's little-endian representation.
 ///
@@ -226,6 +208,8 @@ pub struct Blake2bConfig<F: PrimeField> {
     pub s_word_add: Selector,
     /// Selector for result encoding gate: field = word_1 + word_2 * 2^64.
     pub s_result_encode: Selector,
+    /// Selector for field recomposition gate: field = words[0..1] + words[2..3] * 2^128.
+    pub s_field_recompose: Selector,
     /// Selector for combining two 32-bit words into one 64-bit word.
     pub s_word_combine: Selector,
     /// Selector for 1-bit left shift gate (used for R4=63 rotation).
@@ -251,14 +235,10 @@ pub struct Blake2bConfig<F: PrimeField> {
 /// Each action provides 148 bytes: nf(32B) + cmx(32B) + epk(32B) + enc_prefix(52B).
 #[derive(Debug)]
 pub struct CompactActionCells<F: PrimeField> {
-    /// Nullifier lower 16 bytes.
-    pub nf_lo: AssignedCell<F, F>,
-    /// Nullifier upper 16 bytes.
-    pub nf_hi: AssignedCell<F, F>,
-    /// Note commitment lower 16 bytes.
-    pub cmx_lo: AssignedCell<F, F>,
-    /// Note commitment upper 16 bytes.
-    pub cmx_hi: AssignedCell<F, F>,
+    /// Nullifier (single field element).
+    pub nf: AssignedCell<F, F>,
+    /// Note commitment (single field element).
+    pub cmx: AssignedCell<F, F>,
     /// Ephemeral key bytes (32 cells, each range-checked to [0, 255]).
     pub epk_bytes: [AssignedCell<F, F>; 32],
     /// First 52 bytes of the encrypted note ciphertext.
@@ -287,6 +267,7 @@ impl<F: PrimeField> Blake2bConfig<F> {
         let s_word_decompose = meta.selector();
         let s_word_add = meta.selector();
         let s_result_encode = meta.selector();
+        let s_field_recompose = meta.selector();
         let s_word_combine = meta.selector();
         let s_left_shift_1 = meta.selector();
 
@@ -353,6 +334,18 @@ impl<F: PrimeField> Blake2bConfig<F> {
             let s_result_encode = meta.query_selector(s_result_encode);
 
             vec![s_result_encode * (word_1 + word_2 * F::from_u128(1u128 << 64) - field_element)]
+        });
+
+        // field = sum_01 + sum_23 * 2^128  (4 words packed into one field element)
+        // sum_01 = w0 + w1 * 2^64, sum_23 = w2 + w3 * 2^64 (from s_result_encode)
+        meta.create_gate("recompose field from word-pair sums", |meta| {
+            let field_element = meta.query_advice(advices[A0], Rotation::next());
+            let sum_01 = meta.query_advice(advices[A0], Rotation::cur());
+            let sum_23 = meta.query_advice(advices[A1], Rotation::cur());
+            let s_field_recompose = meta.query_selector(s_field_recompose);
+            let two_128 = F::from_u128(1u128 << 64) * F::from_u128(1u128 << 64);
+
+            vec![s_field_recompose * (sum_01 + sum_23 * two_128 - field_element)]
         });
 
         // word_64 = word_32_lo + word_32_hi * 2^32
@@ -456,6 +449,7 @@ impl<F: PrimeField> Blake2bConfig<F> {
             s_word_decompose,
             s_word_add,
             s_result_encode,
+            s_field_recompose,
             s_word_combine,
             s_left_shift_1,
             q_nibble_xor,
@@ -1001,111 +995,122 @@ impl<F: PrimeField> Blake2bChip<F> {
         )
     }
 
-    // ---- Field decomposition (split 16-byte halves, no canonicality) ----
+    // ---- Field element to BLAKE2b words ----
 
-    /// Decompose a 32-byte value (represented as two 16-byte halves) into
-    /// 4 x 8-byte `Blake2bWord`s.
+    /// Convert a field element into 4 x 64-bit `Blake2bWord`s for BLAKE2b input.
     ///
-    /// Each half is 16 bytes, which trivially fits in the Pallas field (~32 bytes),
-    /// so **no canonicality check is needed**. Bytes are range-checked via lookup.
-    ///
-    /// Pipeline per half: half_field → 16 bytes → range check → 4 x 32-bit words
-    /// → 2 x 64-bit words (via word_combine) → recomposition check (via s_result_encode)
-    fn field_decompose_split(
+    /// Witnesses 32 bytes from the field element, range-checks them, packs into
+    /// 64-bit words, and verifies that the bytes reconstruct the original Fp via
+    /// `s_result_encode` (word-pair sums) and `s_field_recompose` (full field).
+    fn field_to_words(
         &self,
         layouter: &mut impl Layouter<F>,
-        lo: &AssignedCell<F, F>,
-        hi: &AssignedCell<F, F>,
+        field_elem: &AssignedCell<F, F>,
     ) -> Result<Vec<Blake2bWord<F>>, Error> {
-        let mut result: Vec<Blake2bWord<F>> = Vec::with_capacity(4);
-
-        for (half_idx, half) in [lo, hi].iter().enumerate() {
-            let label = if half_idx == 0 { "lo" } else { "hi" };
-
-            // Decompose 16-byte half into individual bytes
-            let mut bytes = Vec::with_capacity(16);
-            for i in 0..16 {
-                let byte_value = half.value().map(|f| {
-                    F::from(f.to_repr().as_ref()[i] as u64)
-                });
-                let byte = assign_free_advice(
-                    layouter.namespace(|| format!("{}_{}", label, i)),
-                    self.config.advices[A0],
-                    byte_value,
-                )?;
-                bytes.push(byte);
-            }
-
-            // Range-check all 16 bytes (2 batches of 8)
-            self.range_check_bytes(
-                layouter.namespace(|| format!("{}_range_0_7", label)),
-                &bytes[0..8],
+        // Decompose field element into 32 individual bytes
+        let mut bytes = Vec::with_capacity(32);
+        for i in 0..32 {
+            let byte_value = field_elem.value().map(|f| {
+                F::from(f.to_repr().as_ref()[i] as u64)
+            });
+            let byte = assign_free_advice(
+                layouter.namespace(|| format!("byte_{}", i)),
+                self.config.advices[A0],
+                byte_value,
             )?;
-            self.range_check_bytes(
-                layouter.namespace(|| format!("{}_range_8_15", label)),
-                &bytes[8..16],
-            )?;
-
-            // Pack bytes into 4 x 32-bit words (range-checked via word_decompose_32)
-            let mut words_32 = Vec::with_capacity(4);
-            for (j, chunk) in bytes.chunks(4).enumerate() {
-                let word = self.assign_word_32_from_bytes(
-                    layouter.namespace(|| format!("{}_w32_{}", label, j)),
-                    chunk,
-                )?;
-                words_32.push(word);
-            }
-
-            // Combine pairs of 32-bit words into 64-bit words
-            for j in 0..2 {
-                let word_64 = self.word_combine(
-                    layouter.namespace(|| format!("{}_w64_{}", label, j)),
-                    &words_32[j * 2],
-                    &words_32[j * 2 + 1],
-                )?;
-
-                // Constrain recomposition: half_field = word64_0 + word64_1 * 2^64
-                if j == 1 {
-                    layouter.assign_region(
-                        || format!("{}_recompose", label),
-                        |mut region| {
-                            self.config.s_result_encode.enable(&mut region, 0)?;
-                            result.last().unwrap().get_word().copy_advice(
-                                || "word_0",
-                                &mut region,
-                                self.config.advices[A0],
-                                0,
-                            )?;
-                            word_64.copy_advice(
-                                || "word_1",
-                                &mut region,
-                                self.config.advices[A1],
-                                0,
-                            )?;
-                            half.copy_advice(
-                                || "field",
-                                &mut region,
-                                self.config.advices[A0],
-                                1,
-                            )?;
-                            Ok(())
-                        },
-                    )?;
-                }
-
-                // Get the bytes for this 64-bit word
-                let word_bytes: [AssignedCell<F, F>; 8] = bytes
-                    [j * 8..(j + 1) * 8]
-                    .to_vec()
-                    .try_into()
-                    .unwrap();
-
-                result.push(Blake2bWord {
-                    word: word_64,
-                    bytes: word_bytes,
-                });
-            }
+            bytes.push(byte);
         }
+
+        // Range-check all 32 bytes (4 batches of 8)
+        for batch in 0..4 {
+            self.range_check_bytes(
+                layouter.namespace(|| format!("range_{}", batch)),
+                &bytes[batch * 8..(batch + 1) * 8],
+            )?;
+        }
+
+        // Pack bytes into 8 x 32-bit words
+        let mut words_32 = Vec::with_capacity(8);
+        for (j, chunk) in bytes.chunks(4).enumerate() {
+            let word = self.assign_word_32_from_bytes(
+                layouter.namespace(|| format!("w32_{}", j)),
+                chunk,
+            )?;
+            words_32.push(word);
+        }
+
+        // Combine pairs of 32-bit words into 4 x 64-bit words
+        let mut words_64 = Vec::with_capacity(4);
+        for j in 0..4 {
+            let word_64 = self.word_combine(
+                layouter.namespace(|| format!("w64_{}", j)),
+                &words_32[j * 2],
+                &words_32[j * 2 + 1],
+            )?;
+            words_64.push(word_64);
+        }
+
+        // Recomposition check: sum_01 = w0 + w1 * 2^64
+        let sum_01_val = words_64[0].value().zip(words_64[1].value())
+            .map(|(&w0, &w1)| w0 + w1 * F::from_u128(1u128 << 64));
+        let sum_01 = assign_free_advice(
+            layouter.namespace(|| "sum_01"),
+            self.config.advices[A0],
+            sum_01_val,
+        )?;
+        layouter.assign_region(
+            || "sum_01_recompose",
+            |mut region| {
+                self.config.s_result_encode.enable(&mut region, 0)?;
+                words_64[0].copy_advice(|| "w0", &mut region, self.config.advices[A0], 0)?;
+                words_64[1].copy_advice(|| "w1", &mut region, self.config.advices[A1], 0)?;
+                sum_01.copy_advice(|| "sum_01", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )?;
+
+        // Recomposition check: sum_23 = w2 + w3 * 2^64
+        let sum_23_val = words_64[2].value().zip(words_64[3].value())
+            .map(|(&w0, &w1)| w0 + w1 * F::from_u128(1u128 << 64));
+        let sum_23 = assign_free_advice(
+            layouter.namespace(|| "sum_23"),
+            self.config.advices[A0],
+            sum_23_val,
+        )?;
+        layouter.assign_region(
+            || "sum_23_recompose",
+            |mut region| {
+                self.config.s_result_encode.enable(&mut region, 0)?;
+                words_64[2].copy_advice(|| "w0", &mut region, self.config.advices[A0], 0)?;
+                words_64[3].copy_advice(|| "w1", &mut region, self.config.advices[A1], 0)?;
+                sum_23.copy_advice(|| "sum_23", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )?;
+
+        // Recomposition check: field_elem = sum_01 + sum_23 * 2^128
+        layouter.assign_region(
+            || "field_recompose",
+            |mut region| {
+                self.config.s_field_recompose.enable(&mut region, 0)?;
+                sum_01.copy_advice(|| "sum_01", &mut region, self.config.advices[A0], 0)?;
+                sum_23.copy_advice(|| "sum_23", &mut region, self.config.advices[A1], 0)?;
+                field_elem.copy_advice(|| "field", &mut region, self.config.advices[A0], 1)?;
+                Ok(())
+            },
+        )?;
+
+        // Build result Blake2bWords
+        let result: Vec<Blake2bWord<F>> = (0..4).map(|j| {
+            let word_bytes: [AssignedCell<F, F>; 8] = bytes[j * 8..(j + 1) * 8]
+                .to_vec()
+                .try_into()
+                .unwrap();
+            Blake2bWord {
+                word: words_64[j].clone(),
+                bytes: word_bytes,
+            }
+        }).collect();
 
         Ok(result)
     }
@@ -1121,7 +1126,7 @@ impl<F: PrimeField> Blake2bChip<F> {
     ///
     /// Since 148 is not a multiple of 8, word 18 spans the boundary between
     /// action 1 and action 2. This function works at the byte level: it extracts
-    /// bytes from field decompositions, range-checks raw byte inputs, concatenates
+    /// bytes from field-to-words conversions, range-checks raw byte inputs, concatenates
     /// all 296 bytes, and packs them into words.
     pub fn process_compact_action_hash(
         &self,
@@ -1157,21 +1162,19 @@ impl<F: PrimeField> Blake2bChip<F> {
         let mut all_bytes: Vec<AssignedCell<F, F>> = Vec::with_capacity(296);
 
         for (action_idx, action) in [action_1, action_2].iter().enumerate() {
-            // Decompose nf into bytes (range-checked by field_decompose_split)
-            let nf_words = self.field_decompose_split(
-                &mut layouter.namespace(|| format!("nf_decompose_{}", action_idx)),
-                &action.nf_lo,
-                &action.nf_hi,
+            // Convert nf field element to BLAKE2b words
+            let nf_words = self.field_to_words(
+                &mut layouter.namespace(|| format!("nf_to_words_{}", action_idx)),
+                &action.nf,
             )?;
             for w in &nf_words {
                 all_bytes.extend_from_slice(w.get_bytes());
             }
 
-            // Decompose cmx into bytes
-            let cmx_words = self.field_decompose_split(
-                &mut layouter.namespace(|| format!("cmx_decompose_{}", action_idx)),
-                &action.cmx_lo,
-                &action.cmx_hi,
+            // Convert cmx field element to BLAKE2b words
+            let cmx_words = self.field_to_words(
+                &mut layouter.namespace(|| format!("cmx_to_words_{}", action_idx)),
+                &action.cmx,
             )?;
             for w in &cmx_words {
                 all_bytes.extend_from_slice(w.get_bytes());

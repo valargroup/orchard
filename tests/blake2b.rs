@@ -9,7 +9,7 @@ use halo2_proofs::{
     plonk::{Circuit, Column, ConstraintSystem, Error, Instance},
 };
 use orchard::circuit::blake2b::{
-    assign_free_advice, split_field_to_halves, Blake2bChip, Blake2bConfig, CompactActionCells,
+    assign_free_advice, Blake2bChip, Blake2bConfig, CompactActionCells,
 };
 use pasta_curves::pallas;
 
@@ -182,16 +182,12 @@ mod reference {
 
 /// Circuit hashing 2 compact actions via `process_compact_action_hash`.
 struct TwoActionHashCircuit {
-    nf_1_lo: Value<pallas::Base>,
-    nf_1_hi: Value<pallas::Base>,
-    cmx_1_lo: Value<pallas::Base>,
-    cmx_1_hi: Value<pallas::Base>,
+    nf_1: Value<pallas::Base>,
+    cmx_1: Value<pallas::Base>,
     epk_1: Value<[u8; 32]>,
     enc_1: Value<[u8; 52]>,
-    nf_2_lo: Value<pallas::Base>,
-    nf_2_hi: Value<pallas::Base>,
-    cmx_2_lo: Value<pallas::Base>,
-    cmx_2_hi: Value<pallas::Base>,
+    nf_2: Value<pallas::Base>,
+    cmx_2: Value<pallas::Base>,
     epk_2: Value<[u8; 32]>,
     enc_2: Value<[u8; 52]>,
     personalization: [u8; 16],
@@ -209,16 +205,12 @@ impl Circuit<pallas::Base> for TwoActionHashCircuit {
 
     fn without_witnesses(&self) -> Self {
         Self {
-            nf_1_lo: Value::unknown(),
-            nf_1_hi: Value::unknown(),
-            cmx_1_lo: Value::unknown(),
-            cmx_1_hi: Value::unknown(),
+            nf_1: Value::unknown(),
+            cmx_1: Value::unknown(),
             epk_1: Value::unknown(),
             enc_1: Value::unknown(),
-            nf_2_lo: Value::unknown(),
-            nf_2_hi: Value::unknown(),
-            cmx_2_lo: Value::unknown(),
-            cmx_2_hi: Value::unknown(),
+            nf_2: Value::unknown(),
+            cmx_2: Value::unknown(),
             epk_2: Value::unknown(),
             enc_2: Value::unknown(),
             personalization: self.personalization,
@@ -283,12 +275,8 @@ impl Circuit<pallas::Base> for TwoActionHashCircuit {
         let col = config.blake2b_config.advices[0];
 
         // Action 1
-        let nf_1_lo = assign_free_advice(layouter.namespace(|| "nf_1_lo"), col, self.nf_1_lo)?;
-        let nf_1_hi = assign_free_advice(layouter.namespace(|| "nf_1_hi"), col, self.nf_1_hi)?;
-        let cmx_1_lo =
-            assign_free_advice(layouter.namespace(|| "cmx_1_lo"), col, self.cmx_1_lo)?;
-        let cmx_1_hi =
-            assign_free_advice(layouter.namespace(|| "cmx_1_hi"), col, self.cmx_1_hi)?;
+        let nf_1 = assign_free_advice(layouter.namespace(|| "nf_1"), col, self.nf_1)?;
+        let cmx_1 = assign_free_advice(layouter.namespace(|| "cmx_1"), col, self.cmx_1)?;
         let epk_1_cells = assign_bytes(
             &mut layouter, col, "epk_1",
             self.epk_1.as_ref().map(|b| b.as_ref()), 32,
@@ -299,12 +287,8 @@ impl Circuit<pallas::Base> for TwoActionHashCircuit {
         )?;
 
         // Action 2
-        let nf_2_lo = assign_free_advice(layouter.namespace(|| "nf_2_lo"), col, self.nf_2_lo)?;
-        let nf_2_hi = assign_free_advice(layouter.namespace(|| "nf_2_hi"), col, self.nf_2_hi)?;
-        let cmx_2_lo =
-            assign_free_advice(layouter.namespace(|| "cmx_2_lo"), col, self.cmx_2_lo)?;
-        let cmx_2_hi =
-            assign_free_advice(layouter.namespace(|| "cmx_2_hi"), col, self.cmx_2_hi)?;
+        let nf_2 = assign_free_advice(layouter.namespace(|| "nf_2"), col, self.nf_2)?;
+        let cmx_2 = assign_free_advice(layouter.namespace(|| "cmx_2"), col, self.cmx_2)?;
         let epk_2_cells = assign_bytes(
             &mut layouter, col, "epk_2",
             self.epk_2.as_ref().map(|b| b.as_ref()), 32,
@@ -315,19 +299,15 @@ impl Circuit<pallas::Base> for TwoActionHashCircuit {
         )?;
 
         let action_1 = CompactActionCells {
-            nf_lo: nf_1_lo,
-            nf_hi: nf_1_hi,
-            cmx_lo: cmx_1_lo,
-            cmx_hi: cmx_1_hi,
+            nf: nf_1,
+            cmx: cmx_1,
             epk_bytes: epk_1_cells.try_into().unwrap(),
             enc_prefix: enc_1_cells.try_into().unwrap(),
         };
 
         let action_2 = CompactActionCells {
-            nf_lo: nf_2_lo,
-            nf_hi: nf_2_hi,
-            cmx_lo: cmx_2_lo,
-            cmx_hi: cmx_2_hi,
+            nf: nf_2,
+            cmx: cmx_2,
             epk_bytes: epk_2_cells.try_into().unwrap(),
             enc_prefix: enc_2_cells.try_into().unwrap(),
         };
@@ -361,25 +341,16 @@ struct ActionData {
 fn build_circuit(a1: &ActionData, a2: &ActionData, personalization: &[u8; 16]) -> TwoActionHashCircuit {
     let nf_1 = pallas::Base::from_repr(a1.nf).expect("valid field element");
     let cmx_1 = pallas::Base::from_repr(a1.cmx).expect("valid field element");
-    let (nf_1_lo, nf_1_hi) = split_field_to_halves(nf_1);
-    let (cmx_1_lo, cmx_1_hi) = split_field_to_halves(cmx_1);
-
     let nf_2 = pallas::Base::from_repr(a2.nf).expect("valid field element");
     let cmx_2 = pallas::Base::from_repr(a2.cmx).expect("valid field element");
-    let (nf_2_lo, nf_2_hi) = split_field_to_halves(nf_2);
-    let (cmx_2_lo, cmx_2_hi) = split_field_to_halves(cmx_2);
 
     TwoActionHashCircuit {
-        nf_1_lo: Value::known(nf_1_lo),
-        nf_1_hi: Value::known(nf_1_hi),
-        cmx_1_lo: Value::known(cmx_1_lo),
-        cmx_1_hi: Value::known(cmx_1_hi),
+        nf_1: Value::known(nf_1),
+        cmx_1: Value::known(cmx_1),
         epk_1: Value::known(a1.epk),
         enc_1: Value::known(a1.enc),
-        nf_2_lo: Value::known(nf_2_lo),
-        nf_2_hi: Value::known(nf_2_hi),
-        cmx_2_lo: Value::known(cmx_2_lo),
-        cmx_2_hi: Value::known(cmx_2_hi),
+        nf_2: Value::known(nf_2),
+        cmx_2: Value::known(cmx_2),
         epk_2: Value::known(a2.epk),
         enc_2: Value::known(a2.enc),
         personalization: *personalization,

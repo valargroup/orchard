@@ -103,6 +103,11 @@ harness = false
 name = "circuit"
 harness = false
 
+[[bench]]
+name = "blake2b"
+harness = false
+
+
 [profile.release]
 debug = true
 

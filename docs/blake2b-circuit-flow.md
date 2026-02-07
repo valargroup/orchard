@@ -1,12 +1,14 @@
-# Compact Action Hash Nullifier Proof — Circuit Flow
+# Compact Action Hash Proof — Circuit Flow
 
 ## Goal
 
-Prove knowledge of a nullifier such that
+Prove knowledge of nullifiers such that
 
-    BLAKE2b-256("ZTxIdOrcActCHash", nf || cmx || epk || enc[0..52]) = action_hash
+    BLAKE2b-256("ZTxIdOrcActCHash", action_1 || action_2) = action_hash
 
-without revealing the nullifier.
+where each action = nf || cmx || epk || enc[0..52] (148B), without
+revealing the nullifiers. The circuit always hashes exactly **2 actions**
+(296B total), matching ZIP-244's `hashOrchardActions`.
 
 
 ## Terminology
@@ -14,346 +16,375 @@ without revealing the nullifier.
 - **`p`** — field modulus
   > The Pallas base field prime, ~2^254. All field arithmetic is mod p.
 
-- **`canonicality`**
-  > A field element x has two 256-bit representations: x and x+p
-  > (since x ≡ x+p mod p). Both decompose to different bytes, producing
-  > different BLAKE2b hashes. The canonicality check forces x < p,
-  > ensuring a unique byte representation. Required for nf and cmx
-  > (which are field elements) but NOT for epk or enc — those are raw
-  > bytes, not field elements. Their byte values *are* the data; there
-  > is no mod-p equivalence to resolve.
-
 - **`IV`** — initialization vector
   > 8 fixed 64-bit constants defined by BLAKE2b (RFC 7693), derived from
-  > the fractional parts of sqrt(2..9). The State Init step XORs some IV
-  > words with the parameter block (digest length, personalization) to
-  > produce the starting hash state h.
+  > the fractional parts of sqrt(2..9).
+
+- **`byte-level representation`**
+  > Blake2bWord stores a packed 64-bit value alongside its 8 individual
+  > byte cells. All XOR and rotation operations work at the byte level
+  > using lookup tables, eliminating the need for bit-level cells.
 
 
-## ZIP-244 Compact Action Hash Inputs
+## Circuit Inputs (2 actions)
 
-### Pallas field elements (canonicality checked, must be < p)
+Each action contributes 148B. For 2 actions: 296B total.
 
-- **`nf`** — nullifier — 32 bytes
-  > A unique tag derived from a note's secret key and position.
-  > Publicly revealing it marks a note as spent.
-  > This is the value we keep private in the proof.
+### Per-action inputs
 
-- **`cmx`** — note commitment — 32 bytes
-  > A Pedersen-like commitment to the note's contents (recipient,
-  > value, etc.). Binds the action to a specific output note without
-  > revealing its details.
+- **`nf`** — nullifier — 32B, split into two 16B field elements
+  > `nf_lo` (lower 16B) and `nf_hi` (upper 16B).
+  > Each half trivially fits in the Pallas field (16B << 32B), so no
+  > canonicality check is needed. Range-checked to 16B via byte
+  > decomposition.
 
-### Arbitrary bytes (boolean-constrained only, may exceed p)
+- **`cmx`** — note commitment — 32B, split into two 16B field elements
+  > `cmx_lo` (lower 16B) and `cmx_hi` (upper 16B).
+  > Same split representation as nf. No canonicality check.
 
-- **`epk`** — ephemeral public key — 32 bytes
-  > A one-time Diffie-Hellman key used by the recipient to decrypt
-  > the note. Serialized as a curve point.
+- **`epk`** — ephemeral public key — 32B (raw)
 
-- **`enc[0..52]`** — 52 bytes
-  > The first 52 bytes of the encrypted note ciphertext. Contains
-  > the encrypted plaintext header (diversifier, value, rseed).
+- **`enc[0..52]`** — 52B (raw)
 
-### Other
+### Output
 
-- **`action_hash`** — 256 bits
-  > The expected BLAKE2b-256 output. The verifier provides this
-  > publicly; the circuit proves the inputs hash to it.
+- **`action_hash`** — 32B, split into 2 field elements (the full hash
+  doesn't fit in one ~255-bit field element)
+  > `hash_0 = word0 + word1 * 2^64` (lower 128 bits) and
+  > `hash_1 = word2 + word3 * 2^64` (upper 128 bits).
+  > Packed by `encode_result()` and exposed as public inputs via
+  > `constrain_instance()`.
 
-- **`"ZTxIdOrcActCHash"`** — 16 bytes
-  > The BLAKE2b personalization string defined by ZIP-244 for the
-  > compact action hash digest.
+- **`"ZTxIdOrcActCHash"`** — 16B BLAKE2b personalization (hardcoded)
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
-║                         CIRCUIT INPUTS                               ║
+║                         CIRCUIT INPUTS (2 ACTIONS)                   ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  PRIVATE (auxiliary witness)        PUBLIC INPUTS                    ║
-║  ┌─────────────────────┐           ┌──────────────────────────┐      ║
-║  │ nullifier           │           │ cmx                      │      ║
-║  │ 32B, Pallas field   │           │ 32B, Pallas field        │      ║
-║  └─────────┬───────────┘           ├──────────────────────────┤      ║
-║            │                       │ epk                      │      ║
-║            │                       │ 32B, curve point         │      ║
-║            │                       ├──────────────────────────┤      ║
-║            │                       │ enc[0..52]               │      ║
-║            │                       │ 52B, ciphertext          │      ║
-║            │                       ├──────────────────────────┤      ║
-║            │                       │ expected action_hash     │      ║
-║            │                       │ 256 bits (4 x 64-bit)    │      ║
-║            │                       └────────┬─────────────────┘      ║
-╚════════════╪════════════════════════════════╪════════════════════════╝
-             │                                │
-             ▼                                ▼
+║  PRIVATE (auxiliary witness)         PUBLIC INPUTS                   ║
+║  ┌───────────────────────────┐      ┌──────────────────────────┐     ║
+║  │ Action 1:                 │      │ Action 1:                │     ║
+║  │   nf_1_lo (Fp, 16B)       │      │   cmx_1_lo (Fp, 16B)     │     ║
+║  │   nf_1_hi (Fp, 16B)       │      │   cmx_1_hi (Fp, 16B)     │     ║
+║  │                           │      │   epk_1    (32B)         │     ║
+║  ├───────────────────────────┤      │   enc_1    (52B)         │     ║
+║  │ Action 2:                 │      ├──────────────────────────┤     ║
+║  │   nf_2_lo (Fp, 16B)       │      │ Action 2:                │     ║
+║  │   nf_2_hi (Fp, 16B)       │      │   cmx_2_lo (Fp, 16B)     │     ║
+║  └───────────┬───────────────┘      │   cmx_2_hi (Fp, 16B)     │     ║
+║              │                      │   epk_2    (32B)         │     ║
+║              │                      │   enc_2    (52B)         │     ║
+║              │                      ├──────────────────────────┤     ║
+║              │                      │ expected action_hash     │     ║
+║              │                      │ 2 field elements         │     ║
+║              │                      └────────┬─────────────────┘     ║
+╚══════════════╪═══════════════════════════════╪═══════════════════════╝
+               │                               │
+               ▼                               ▼
 ╔══════════════════════════════════════════════════════════════════════╗
-║  process_hybrid(field_inputs, byte_inputs, personalization)          ║
-║    field_inputs  = [nullifier, cmx]                                  ║
-║    byte_inputs   = epk(32) ++ enc(52) = 84 bytes                     ║
-║    personalization = "ZTxIdOrcActCHash"                              ║
-╚════════════════════════╤═════════════════════════════════════════════╝
-                         │
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-┌──────────────┐  ┌────────────┐  ┌──────────────────┐
-│ State Init   │  │ Field Path │  │   Byte Path      │
-│ (see below)  │  │ nf, cmx    │  │ epk, enc[0..52]  │
-└──────┬───────┘  └─────┬──────┘  └─────────┬────────┘
-       │                │                   │
-       │                ▼                   ▼
-       │         ┌─────────────┐     ┌─────────────┐
-       │         │ 4+4 = 8     │     │ 4+7 = 11    │
-       │         │ 64-bit words│     │ 64-bit words│
-       │         └──────┬──────┘     └──────┬──────┘
-       │                │                   │
-       │                └───────┬───────────┘
-       │                        ▼
-       │              ┌────────────────────┐
-       │              │  Block Assembly    │
-       │              │  19 words total    │
-       │              │  Block 1: [0..15]  │
-       │              │  Block 2: [16..18] │
-       │              │  + 13 zero words   │
-       │              │  (BLAKE2b requires │
-       │              │  full 16-word      │
-       │              │  blocks)           │
-       │              └────────┬───────────┘
-       │                       │
-       ▼                       ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  Compression Loop                                        │
-   │                                                          │
-   │  h = 8-word (512-bit) running state, starts from         │
-   │      State Init (IV with personalization XORed in).      │
-   │  m = the 16-word message block being compressed.         │
-   │                                                          │
-   │  Step 1: compress(h, m=block1, t=128, f=false)           │
-   │          Mixes block 1 into h. t=128 means 128 bytes     │
-   │          processed so far. f=false: not the last block.  │
-   │                                                          │
-   │  Step 2: compress(h, m=block2, t=148, f=true)            │
-   │          Mixes block 2 into h. t=148 = total real input  │
-   │          bytes (2x32 + 84). f=true: final block, which   │
-   │          flips v[14] to signal finalization.             │
-   │                                                          │
-   │  After step 2, h holds the full BLAKE2b hash.            │
-   └──────────────────────────┬───────────────────────────────┘
+║  process_compact_action_hash(action_1, action_2, personalization)    ║
+╚════════════════════════════════╤═════════════════════════════════════╝
+                                 │
+              ┌──────────────────┼──────────────┐
+              ▼                  ▼              ▼
+    ┌──────────────┐   ┌─────────────┐   ┌──────────────────┐
+    │ field_       │   │ Range-check │   │ Range-check      │
+    │ decompose_   │   │ epk bytes   │   │ enc bytes        │
+    │ split        │   │ (32B each)  │   │ (52B each)       │
+    │ nf (32B),    │   └──────┬──────┘   └─────────┬────────┘
+    │ cmx (32B)    │          │                    │
+    │ per action   │          │                    │
+    └──────┬───────┘          │                    │
+           │                  │                    │
+           └──────────────────┼────────────────────┘
+                              │
+                    ┌─────────▼──────────────────┐
+                    │ Concatenate all bytes in   │
+                    │ message order (per action):│
+                    │ nf‖cmx‖epk‖enc = 148B      │
+                    │ × 2 actions = 296B         │
+                    └─────────┬──────────────────┘
+                              │
+                    ┌─────────▼──────────────────┐
+                    │  Pack into 37 x 64-bit     │
+                    │  words [s_word_decompose]  │
+                    └─────────┬──────────────────┘
+                              │
+                    ┌─────────▼──────────────────┐
+                    │  Block Assembly            │
+                    │  Block 1: words [0..15]    │
+                    │  Block 2: words [16..31]   │
+                    │  Block 3: words [32..36]   │
+                    │    + 11 zero-pad words     │
+                    └─────────┬──────────────────┘
                               │
                               ▼
-              ┌──────────────────────────────────────────┐
-              │ Take h[0..3] (first 4 of 8 words)        │
-              │ = 256-bit BLAKE2b-256 digest of          │
-              │   nf || cmx || epk || enc[0..52]         │
-              │ (h[4..7] discarded — only needed         │
-              │  for BLAKE2b-512)                        │
-              └──────────────────┬───────────────────────┘
-                                 │
-                                 ▼
-              ┌──────────────────────────────────────────┐
-              │ encode_result()                          │
-              │                                          │
-              │ The hash is 4 x 64-bit words, but halo2  │
-              │ public inputs must be field elements.    │
-              │ So we pack pairs of words into fields:   │
-              │   field_0 = word0 + word1 * 2^64         │
-              │   field_1 = word2 + word3 * 2^64         │
-              │                                          │
-              │ [s_result_encode] gate constrains the    │
-              │ packing is correct. 4 words → 2 fields.  │
-              └──────────────────┬───────────────────────┘
-                                 │
-                                 ▼
-              ┌──────────────────────────────────────────┐
-              │ constrain_instance() x 2                 │
-              │                                          │
-              │ The verifier provides the expected       │
-              │ action_hash (also packed as 2 fields)    │
-              │ in the instance column (public input).   │
-              │ The prover's field_0, field_1 live in    │
-              │ advice cells (private computation).      │
-              │                                          │
-              │ Two equality constraints:                │
-              │   advice[field_0] == instance[row 0]     │
-              │   advice[field_1] == instance[row 1]     │
-              │                                          │
-              │ Both must match. If the prover used the  │
-              │ wrong nullifier, the hash won't match,   │
-              │ and the proof is invalid.                │
-              └──────────────────────────────────────────┘
-
-
-═══════════════════════════════════════════════════════════════════
- STATE INIT — BLAKE2b-256 (RFC 7693 §2.5)
-═══════════════════════════════════════════════════════════════════
-
-  h[0] = IV[0] XOR 0x01010020       parameter block (little-endian):
-                                      0x 01 01 00 20
-                                         │  │  │  └── digest length = 0x20 = 32 bytes
-                                         │  │  └───── key length    = 0
-                                         │  └──────── fanout        = 1 (sequential)
-                                         └─────────── depth         = 1 (sequential)
-  h[1] = IV[1]
-  h[2] = IV[2]
-  h[3] = IV[3]
-  h[4] = IV[4]
-  h[5] = IV[5]
-  h[6] = IV[6] XOR "ZTxIdOrc"       first 8 bytes of personalization
-  h[7] = IV[7] XOR "ActCHash"       last 8 bytes of personalization
-
-  How constants enter the circuit (Blake2bWord::from_constant_u64()):
-    The compression function XORs values bit-by-bit, so every
-    word — even a known constant like IV[0] — must be decomposed
-    into individual bits the circuit can operate on:
-      u64 → 8 bytes (each in its own cell) → 64 bits (each boolean-constrained)
-    [s_word_decompose] proves the 8 bytes reconstruct the word.
-    [s_byte_decompose] proves each byte's 8 bits reconstruct that byte.
-
-
-═══════════════════════════════════════════════════════════════════
- FIELD ELEMENT PATH — nullifier, cmx (canonicality checked)
-═══════════════════════════════════════════════════════════════════
-
-  field_decompose() pipeline per field element:
-
   ┌──────────────────────────────────────────────────────────┐
-  │ 1. field → 32 bytes → 256 bits                           │
-  │    Blake2bByte::from_u8() for each byte                  │
-  │    [s_byte_decompose] bool-constrains every bit          │
-  ├──────────────────────────────────────────────────────────┤
-  │ 2. 32 bytes → 8 x 32-bit words                           │
-  │    assign_word_32_from_bytes()                           │
-  │    [s_word_decompose] gate (upper 4 bytes zeroed)        │
-  ├──────────────────────────────────────────────────────────┤
-  │ 3. Recomposition check                                   │
-  │    [s_field_decompose] gate                              │
-  │    field = w1 + w2*2^32 + w3*2^64 + ... + w8*2^224       │
-  ├──────────────────────────────────────────────────────────┤
-  │ 4. CANONICALITY CHECK (see detail below)                 │
-  │    Ensures 256-bit decomposition < p                     │
-  │    Prevents x vs x+p ambiguity                           │
-  ├──────────────────────────────────────────────────────────┤
-  │ 5. Combine pairs → 4 x 64-bit words                      │
-  │    [s_word_combine] gate                                 │
-  │    w64 = w32_lo + w32_hi * 2^32                          │
-  └──────────────────────────────────────────────────────────┘
-
-  Canonicality check detail (check_canonicality):
-
-    Pallas p = 0x40000000_00000000_..._224698fc_..._00000001
-
-    ┌───────────────────────────────────────────────────────┐
-    │ a. compute_lower_128_and_diff()                       │
-    │    lower_128 = w1 + w2*2^32 + w3*2^64 + w4*2^96       │
-    │    diff = p_lower - 1 - lower_128                     │
-    ├───────────────────────────────────────────────────────┤
-    │ b. [s_canonicality] gate:                             │
-    │    - bit[255] must be 0                               │
-    │    - lower_128 decomposition correct                  │
-    │    - bit[254] * (diff - (p_lower-1-lower_128)) = 0    │
-    │    - bit[254] * (diff - sum_of_diff_words) = 0        │
-    ├───────────────────────────────────────────────────────┤
-    │ c. [s_high_bit_zero] x 126 rows:                      │
-    │    bit[254] * bit[i] = 0   for i in [128..254)        │
-    │    (if bit 254 is set, all bits 128-253 must be 0)    │
-    ├───────────────────────────────────────────────────────┤
-    │ d. Range-check each diff word (4 words):              │
-    │    word → 4 bytes → bits                              │
-    │    [s_word_decompose] + [s_byte_decompose]            │
-    │    Proves diff >= 0, thus lower_128 < p_lower         │
-    └───────────────────────────────────────────────────────┘
+  │  Compression Loop (3 calls for 296B input)               │
+  │                                                          │
+  │  compress(h, block1, t=128, f=false)                     │
+  │  compress(h, block2, t=256, f=false)                     │
+  │  compress(h, block3, t=296, f=true)                      │
+  │                                                          │
+  │  After final compress, h holds the BLAKE2b hash.         │
+  └──────────────────────────┬───────────────────────────────┘
+                             │
+                             ▼
+             ┌──────────────────────────────────────────┐
+             │ Take h[0..3] (first 4 of 8 words)        │
+             │ = 32B BLAKE2b-256 digest                 │
+             └──────────────────┬───────────────────────┘
+                                │
+                                ▼
+             ┌──────────────────────────────────────────┐
+             │ encode_result()                          │
+             │                                          │
+             │ Pack 4 words into 2 field elements:      │
+             │   field_0 = word0 + word1 * 2^64         │
+             │   field_1 = word2 + word3 * 2^64         │
+             │                                          │
+             │ [s_result_encode] gate constrains the    │
+             │ packing. 4 words → 2 fields.             │
+             └──────────────────┬───────────────────────┘
+                                │
+                                ▼
+             ┌──────────────────────────────────────────┐
+             │ constrain_instance() x 2                 │
+             │                                          │
+             │ The verifier provides the expected       │
+             │ action_hash (packed as 2 fields) in the  │
+             │ instance column (public input).          │
+             │                                          │
+             │   advice[field_0] == instance[row 0]     │
+             │   advice[field_1] == instance[row 1]     │
+             └──────────────────────────────────────────┘
+```
 
 
 ═══════════════════════════════════════════════════════════════════
- RAW BYTE PATH — epk (32B), enc[0..52] (52B)
+ FIELD DECOMPOSITION — nf, cmx (16B halves, no canonicality)
 ═══════════════════════════════════════════════════════════════════
 
-  bytes_to_words() pipeline:
+  Each 32B value (nf, cmx) is 256 bits, which exceeds the Pallas
+  field capacity (~255 bits). So each is split into **two 16B halves**
+  (lo + hi). Since 128 bits << ~255 bits, each half trivially fits
+  in the field — no canonicality check is needed.
 
+  **Why this is sound:** In the full Orchard circuit, the nullifier is
+  derived from a Poseidon hash (which outputs an Fp element). The Orchard
+  circuit constrains `nf = nf_lo + nf_hi * 2^128` and knows nf is
+  canonical because it's a constrained Fp output. The Blake2b sub-circuit
+  doesn't need to independently verify canonicality — it just needs the
+  byte decomposition to be correct, which the 16B range checks
+  guarantee.
+
+  `field_decompose_split()` pipeline per (lo, hi) pair:
+
+```
   ┌──────────────────────────────────────────────────────────┐
-  │ 1. Each byte → 8 bits                                    │
-  │    [s_byte_decompose] gate (boolean constraints only)    │
-  │    NO canonicality — values can exceed field modulus p   │
+  │ 1. Decompose lo (16B) into 16 individual bytes           │
+  │    Prover provides byte values as witness. Each byte     │
+  │    range-checked to [0,255] via byte_range lookup table  │
+  │    (prevents prover from claiming a "byte" is e.g. 300). │
   ├──────────────────────────────────────────────────────────┤
-  │ 2. Pad bits to multiple of 64                            │
-  │    (84 bytes = 672 bits → needs 32 zero-padding bits)    │
+  │ 2. Pack 16 bytes into 2 x 64-bit words (8 bytes each)    │
+  │    [s_word_decompose] gate constrains:                   │
+  │    word = b0 + b1*2^8 + b2*2^16 + ... + b7*2^56          │
+  │    Produces Blake2bWord structs for compression.         │
   ├──────────────────────────────────────────────────────────┤
-  │ 3. Pack into 64-bit Blake2bWords via from_bits()         │
-  │    84 bytes → 11 words (704 bits / 64)                   │
+  │ 3. Recomposition check (integrity)                       │
+  │    [s_result_encode] gate (reused):                      │
+  │    lo == word_0 + word_1 * 2^64                          │
+  │    Proves the bytes actually represent the original lo.  │
+  │    Without this, prover could hash wrong data.           │
+  ├──────────────────────────────────────────────────────────┤
+  │ 4. Repeat steps 1-3 for hi → 2 more 64-bit words         │
+  ├──────────────────────────────────────────────────────────┤
+  │ Result: 4 x 64-bit Blake2bWords per 32B input value      │
+  │         No canonicality check needed (16B << ~255 bits). │
   └──────────────────────────────────────────────────────────┘
+```
+
+
+═══════════════════════════════════════════════════════════════════
+ BLOCK LAYOUT — 2 actions (296B → 3 blocks)
+═══════════════════════════════════════════════════════════════════
+
+```
+  Action 1 (148B):
+    nf_1 (32B) + cmx_1 (32B) + epk_1 (32B) + enc_1 (52B)
+
+  Action 2 (148B):
+    nf_2 (32B) + cmx_2 (32B) + epk_2 (32B) + enc_2 (52B)
+
+  Total: 296B = 37 x 64-bit words
+
+  Block 1 (words 0-15):  128B
+    nf_1(32) + cmx_1(32) + epk_1(32) + enc_1[0..32]
+
+  Block 2 (words 16-31): 128B
+    enc_1[32..52](20) + nf_2(32) + cmx_2(32) + epk_2(32) + enc_2[0..12]
+
+  Block 3 (words 32-36): 40B + 88B zero padding
+    enc_2[12..52](40) + zeros(88)
+
+  Compression calls:
+    compress(h, block1, t=128, f=false)
+    compress(h, block2, t=256, f=false)
+    compress(h, block3, t=296, f=true)
+```
 
 
 ═══════════════════════════════════════════════════════════════════
  COMPRESSION — compress() (RFC 7693 §3.2)
 ═══════════════════════════════════════════════════════════════════
 
-  Called once per block. For 148-byte input: 2 calls.
+  Called once per block. For 296B input: 3 calls.
 
+```
   ┌────────────────────────────────────────────────────────────┐
   │ 1. Init working vector v[0..15]:                           │
   │    v[0..7]  = h[0..7]            (current state)           │
-  │    v[8..11] = IV[0..3]                                     │
-  │    v[12]    = IV[4] XOR t_lo     (byte counter low)        │
-  │    v[13]    = IV[5] XOR t_hi     (byte counter high)       │
-  │    v[14]    = IV[6] XOR 0xFF..FF (if final block)          │
-  │    v[15]    = IV[7]                                        │
+  │    v[8..11] = IV[0..3]           (constants)               │
+  │    v[12]    = IV[4] XOR t_lo     (constant)                │
+  │    v[13]    = IV[5] XOR t_hi     (constant)                │
+  │    v[14]    = IV[6] XOR 0xFF..FF (if final, constant)      │
+  │    v[15]    = IV[7]              (constant)                │
   ├────────────────────────────────────────────────────────────┤
   │ 2. 12 rounds of mixing:                                    │
-  │    Each round uses SIGMA[round % 10] permutation and       │
-  │    performs 8 G() calls (4 column + 4 diagonal):           │
-  │                                                            │
-  │    Column:   G(0,4,8,12)  G(1,5,9,13)                      │
-  │              G(2,6,10,14) G(3,7,11,15)                     │
-  │                                                            │
-  │    Diagonal: G(0,5,10,15) G(1,6,11,12)                     │
-  │              G(2,7,8,13)  G(3,4,9,14)                      │
-  │                                                            │
-  │    Total: 12 rounds x 8 G calls = 96 G invocations         │
+  │    Each round: 8 G() calls (4 column + 4 diagonal)         │
+  │    Total: 12 × 8 = 96 G invocations per compress call      │
   ├────────────────────────────────────────────────────────────┤
   │ 3. Finalize:                                               │
-  │    h[i] = h[i] XOR v[i] XOR v[i+8]   for i = 0..7          │
-  │    (two word_xor + from_bits per word)                     │
+  │    h[i] = h[i] XOR v[i] XOR v[i+8]   for i = 0..7         │
+  │    (two byte-level word_xor + word reconstruction)         │
   └────────────────────────────────────────────────────────────┘
+```
 
 
 ═══════════════════════════════════════════════════════════════════
  G MIXING FUNCTION — G(v, a, b, c, d, x, y) (RFC 7693 §3.1)
 ═══════════════════════════════════════════════════════════════════
 
-  The atomic mixing unit. Uses Add-Rotate-XOR (ARX) to diffuse
-  message words into the state. Called 8 times per round (4 column
-  + 4 diagonal) x 12 rounds = 96 calls, ensuring every word is
-  thoroughly entangled with every other.
+  The atomic mixing unit. Uses Add-Rotate-XOR (ARX) at the **byte level**.
+  Called 96 times per compression call.
 
   All arithmetic is mod 2^64. Rotations are right-rotations.
 
+```
   ┌──────────────────────────────────────────────────────────┐
   │ v[a] = v[a] + v[b] + x          [s_word_add x 2]         │
-  │ v[d] = (v[d] XOR v[a]) >>> 32   [s_byte_xor x 8]         │
+  │ v[d] = (v[d] XOR v[a]) >>> 32   byte shuffle [4..7,0..3] │
   │ v[c] = v[c] + v[d]              [s_word_add]             │
-  │ v[b] = (v[b] XOR v[c]) >>> 24   [s_byte_xor x 8]         │
+  │ v[b] = (v[b] XOR v[c]) >>> 24   byte shuffle [3..7,0..2] │
   │ v[a] = v[a] + v[b] + y          [s_word_add x 2]         │
-  │ v[d] = (v[d] XOR v[a]) >>> 16   [s_byte_xor x 8]         │
+  │ v[d] = (v[d] XOR v[a]) >>> 16   byte shuffle [2..7,0..1] │
   │ v[c] = v[c] + v[d]              [s_word_add]             │
-  │ v[b] = (v[b] XOR v[c]) >>> 63   [s_byte_xor x 8]         │
+  │ v[b] = (v[b] XOR v[c]) >>> 63   [s_left_shift_1] gate    │
   └──────────────────────────────────────────────────────────┘
+```
 
-  Per G call: 6 additions + 4 XOR/rotates + 8 word reconstructions
-  Per block:  96 G calls = 576 additions, 384 XORs
+  **XOR:** Each byte XOR splits both input bytes into nibbles, performs
+  two 4-bit XOR lookups (lo and hi), and recombines. 1 row per byte XOR,
+  using 9 of 10 advice columns.
+
+  **Rotation details:**
+  - **R1=32:** Pure byte shuffle `[4,5,6,7,0,1,2,3]` — **zero constraints**
+  - **R2=24:** Pure byte shuffle `[3,4,5,6,7,0,1,2]` — **zero constraints**
+  - **R3=16:** Pure byte shuffle `[2,3,4,5,6,7,0,1]` — **zero constraints**
+  - **R4=63:** Equivalent to left-rotate by 1 bit. Uses `s_left_shift_1`
+    gate: `2 * byte_in + carry_in = byte_out + 256 * carry_out`,
+    `bool_check(carry_out)`.
+    3 constraints per byte × 8 bytes = **24 constraints** per R4 rotation.
+
+  **Per G call:**
+  - 6 additions (s_word_add)
+  - 4 XOR operations (8 byte lookups each = 32 lookups)
+  - 3 free byte shuffles (R1, R2, R3)
+  - 1 left-shift-1 (R4, 24 constraints)
+  - 4 word reconstructions from bytes (s_word_decompose)
+
+  **Per compression call:** 96 G calls
 
 
 ═══════════════════════════════════════════════════════════════════
- CUSTOM CONSTRAINT GATES (9 total)
+ BLAKE2b WORD REPRESENTATION
 ═══════════════════════════════════════════════════════════════════
 
-  Gate                  Constraint
-  ───────────────────── ──────────────────────────────────────────
-  s_field_decompose     field = w1 + w2*2^32 + ... + w8*2^224
-  s_word_decompose      word = b1 + b2*2^8 + ... + b8*2^56
-  s_byte_decompose      byte = sum(bit_i * 2^i) + bool_check(each)
-  s_byte_xor            out = a + b - 2ab  (per bit, 8 bits)
-  s_word_add            lhs + rhs = out + carry*2^64, bool(carry)
-  s_result_encode       field = w1 + w2*2^64
-  s_canonicality        bit255=0, lower128 decomp, diff check
-  s_high_bit_zero       bit254 * bit = 0
-  s_word_combine        w64 = w32_lo + w32_hi*2^32
+```
+  pub struct Blake2bWord<F: PrimeField> {
+      word: AssignedCell<F, F>,        // packed 64-bit value
+      bytes: [AssignedCell<F, F>; 8],  // 8 byte cells, each in [0,255]
+  }
+```
+
+  All operations work at the byte level:
+  - XOR: nibble-level lookup (2 lookups per byte, 16 per word)
+  - Rotation: byte shuffle (free) or s_left_shift_1 (R4 only)
+  - Addition: operates on packed word (unchanged)
+  - Decomposition: word ↔ bytes via s_word_decompose (unchanged)
+
+
+═══════════════════════════════════════════════════════════════════
+ LOOKUP TABLES
+═══════════════════════════════════════════════════════════════════
+
+  Two lookup tables are loaded once during synthesis:
+
+  **1. Nibble XOR Table** (256 entries):
+```
+    (lhs, rhs, out) for all lhs, rhs in [0, 15]
+    out = lhs XOR rhs
+
+    Each byte XOR uses 9 columns on 1 row:
+      A0=byte_a  A1=byte_b  A2=lo_a  A3=hi_a
+      A4=lo_b    A5=hi_b    A6=lo_out A7=hi_out  A8=out_byte
+
+    Gate (q_nibble_xor):
+      byte_a = lo_a + hi_a * 16
+      byte_b = lo_b + hi_b * 16
+      out_byte = lo_out + hi_out * 16
+
+    Lookups (2, sharing same table):
+      (lo_a, lo_b, lo_out) in XOR table
+      (hi_a, hi_b, hi_out) in XOR table
+```
+
+  **2. Byte Range Table** (256 entries):
+```
+    [0, 1, 2, ..., 255]
+
+    Lookup constraint (q_range_check_8 selector):
+      (s * val, range_table)
+
+    Used to range-check byte cells to [0, 255].
+```
+
+
+═══════════════════════════════════════════════════════════════════
+ CUSTOM GATES AND LOOKUPS
+═══════════════════════════════════════════════════════════════════
+
+  **Gates:**
+
+```
+  Gate                Purpose                              Cost
+  ─────────────────── ──────────────────────────────────── ──────────
+  s_word_decompose    word = b1 + b2*2^8 + ... + b8*2^56  1 constraint
+  s_word_add          lhs + rhs = out + carry*2^64         2 constraints
+  s_result_encode     field = w1 + w2*2^64                 1 constraint
+  s_word_combine      w64 = w32_lo + w32_hi*2^32           1 constraint
+  s_left_shift_1      2*in + c_in = out + 256*c_out        3 constraints/byte
+  q_nibble_xor        byte = lo + hi*16 (decompose)        3 constraints
+```
+
+  **Lookups:**
+
+```
+  Lookup              Purpose                              Cost
+  ─────────────────── ──────────────────────────────────── ──────────
+  nibble_xor_lo       (lo_a, lo_b, lo_out) in XOR table    1 lookup/byte
+  nibble_xor_hi       (hi_a, hi_b, hi_out) in XOR table    1 lookup/byte
+  byte_range          val in [0, 255]                       1 lookup/byte
 ```

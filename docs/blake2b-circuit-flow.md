@@ -328,23 +328,26 @@ Each action contributes 148B. For 2 actions: 296B total.
   Two lookup tables are loaded once during synthesis:
 
   **1. Nibble XOR Table** (256 entries):
+
+  Instead of a full byte XOR table (256 × 256 = 65,536 rows, requiring
+  K≥17), each byte is split into two 4-bit nibbles (lo and hi), and two
+  smaller lookups are performed against a single 16 × 16 = 256-row table.
+  This enables K=15 (4x smaller circuit).
+
+  **Worked example** — `0xA7 XOR 0x3B`:
 ```
-    (lhs, rhs, out) for all lhs, rhs in [0, 15]
-    out = lhs XOR rhs
+    byte_a = 0xA7  →  lo_a = 0x7,  hi_a = 0xA
+    byte_b = 0x3B  →  lo_b = 0xB,  hi_b = 0x3
 
-    Each byte XOR uses 9 columns on 1 row:
-      A0=byte_a  A1=byte_b  A2=lo_a  A3=hi_a
-      A4=lo_b    A5=hi_b    A6=lo_out A7=hi_out  A8=out_byte
+    Lookup 1 (lo nibbles):  0x7 XOR 0xB = 0xC
+    Lookup 2 (hi nibbles):  0xA XOR 0x3 = 0x9
 
-    Gate (q_nibble_xor):
-      byte_a = lo_a + hi_a * 16
-      byte_b = lo_b + hi_b * 16
-      out_byte = lo_out + hi_out * 16
-
-    Lookups (2, sharing same table):
-      (lo_a, lo_b, lo_out) in XOR table
-      (hi_a, hi_b, hi_out) in XOR table
+    Recombine: result = 0xC + 0x9 * 16 = 0x9C
+    Check: 0xA7 XOR 0x3B = 0x9C  ✓
 ```
+
+  Each byte XOR uses 9 columns on 1 row, with 2 queries into the
+  same table and a gate (`q_nibble_xor`) constraining `byte = lo + hi * 16`.
 
   **2. Byte Range Table** (256 entries):
 ```
@@ -377,7 +380,8 @@ Each action contributes 148B. For 2 actions: 296B total.
 ```
   Lookup              Purpose                              Cost
   ─────────────────── ──────────────────────────────────── ──────────
-  nibble_xor_lo       (lo_a, lo_b, lo_out) in XOR table    1 lookup/byte
-  nibble_xor_hi       (hi_a, hi_b, hi_out) in XOR table    1 lookup/byte
+  nibble_xor          (nibble_a, nibble_b, out) in XOR     2 lookups/byte
+                      table — queried once for lo nibbles,  (same table)
+                      once for hi nibbles
   byte_range          val in [0, 255]                      1 lookup/byte
 ```

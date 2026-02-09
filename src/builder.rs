@@ -757,7 +757,7 @@ impl OutputView for RecipientInfo {
 }
 
 /// Generators for property testing.
-#[cfg(any(test, feature = "test-dependencies"))]
+#[cfg(feature = "test-dependencies")]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-dependencies")))]
 pub mod testing {
     use core::fmt::Debug;

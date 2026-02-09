@@ -31,6 +31,8 @@ pub mod tree;
 pub mod value;
 #[cfg(feature = "vote")]
 pub mod vote;
+#[cfg(feature = "delegation")]
+pub mod delegation;
 pub mod zip32;
 
 #[cfg(test)]

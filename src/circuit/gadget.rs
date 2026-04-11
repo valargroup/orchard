@@ -199,7 +199,8 @@ pub fn derive_nullifier<
     // `product` = [poseidon_hash(nk, rho) + psi] NullifierK.
     //
     let product = {
-        let nullifier_k = FixedPointBaseField::from_inner(ecc_chip, OrchardBaseFieldBases::NullifierK);
+        let nullifier_k =
+            FixedPointBaseField::from_inner(ecc_chip, OrchardBaseFieldBases::NullifierK);
         nullifier_k.mul(
             layouter.namespace(|| "[poseidon_output + psi] NullifierK"),
             scalar,

@@ -78,8 +78,8 @@ pub enum OrchardBaseFieldBases {
 pub enum OrchardShortScalarBases {
     /// Value commitment generator for Orchard (original short base).
     ValueCommitV,
-    /// SpendAuthG with short (22-window) tables, used for [v_i]*G in ElGamal
-    /// encryption where v_i is range-checked to 30 bits by condition 9.
+    /// SpendAuthG with short (22-window) tables, used for `[v_i]*G` in ElGamal
+    /// encryption where `v_i` is range-checked to 30 bits by condition 9.
     SpendAuthGShort,
 }
 
@@ -278,7 +278,6 @@ mod tests {
     /// same 85-window structure); this test makes the dispatch wiring explicit.
     #[test]
     fn spend_auth_g_base_field_routes_correctly() {
-
         let full = OrchardFixedBasesFull::SpendAuthG;
         let base = OrchardBaseFieldBases::SpendAuthGBase;
 
@@ -303,7 +302,6 @@ mod tests {
     /// NullifierK generator and tables (regression guard for the enum refactor).
     #[test]
     fn nullifier_k_base_field_routes_correctly() {
-
         let base = OrchardBaseFieldBases::NullifierK;
 
         assert_eq!(
@@ -327,7 +325,6 @@ mod tests {
     /// SpendAuthG generator and the 22-window short tables.
     #[test]
     fn spend_auth_g_short_routes_correctly() {
-
         let short = OrchardShortScalarBases::SpendAuthGShort;
         let full = OrchardFixedBasesFull::SpendAuthG;
 
@@ -358,7 +355,6 @@ mod tests {
     /// the ValueCommitV generator and tables (regression guard for the enum change).
     #[test]
     fn value_commit_v_short_routes_correctly() {
-
         let short = OrchardShortScalarBases::ValueCommitV;
         let legacy = ValueCommitV;
 

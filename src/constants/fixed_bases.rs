@@ -99,14 +99,14 @@ impl From<OrchardFixedBasesFull> for OrchardFixedBases {
 }
 
 impl From<ValueCommitV> for OrchardFixedBases {
-    fn from(_value_commit_v: ValueCommitV) -> Self {
-        Self::Short(OrchardShortScalarBases::ValueCommitV)
+    fn from(value_commit_v: ValueCommitV) -> Self {
+        Self::Short(value_commit_v.into())
     }
 }
 
 impl From<NullifierK> for OrchardFixedBases {
-    fn from(_nullifier_k: NullifierK) -> Self {
-        Self::Base(OrchardBaseFieldBases::NullifierK)
+    fn from(nullifier_k: NullifierK) -> Self {
+        Self::Base(nullifier_k.into())
     }
 }
 
@@ -119,6 +119,18 @@ impl From<OrchardBaseFieldBases> for OrchardFixedBases {
 impl From<OrchardShortScalarBases> for OrchardFixedBases {
     fn from(b: OrchardShortScalarBases) -> Self {
         Self::Short(b)
+    }
+}
+
+impl From<NullifierK> for OrchardBaseFieldBases {
+    fn from(_nullifier_k: NullifierK) -> Self {
+        Self::NullifierK
+    }
+}
+
+impl From<ValueCommitV> for OrchardShortScalarBases {
+    fn from(_value_commit_v: ValueCommitV) -> Self {
+        Self::ValueCommitV
     }
 }
 
@@ -321,6 +333,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nullifier_k_converts_to_base_field_enum() {
+        assert_eq!(OrchardBaseFieldBases::from(NullifierK), OrchardBaseFieldBases::NullifierK);
+    }
+
     /// Ensures that `OrchardShortScalarBases::SpendAuthGShort` routes to the
     /// SpendAuthG generator and the 22-window short tables.
     #[test]
@@ -361,5 +378,13 @@ mod tests {
         assert_eq!(short.generator(), legacy.generator());
         assert_eq!(short.u(), legacy.u());
         assert_eq!(short.z(), legacy.z());
+    }
+
+    #[test]
+    fn value_commit_v_converts_to_short_scalar_enum() {
+        assert_eq!(
+            OrchardShortScalarBases::from(ValueCommitV),
+            OrchardShortScalarBases::ValueCommitV
+        );
     }
 }

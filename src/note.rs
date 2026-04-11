@@ -17,7 +17,7 @@ use crate::{
 
 /// Note commitment types.
 pub mod commitment;
-pub use self::commitment::{ExtractedNoteCommitment, NoteCommitTrapdoor, NoteCommitment};
+pub use self::commitment::{ExtractedNoteCommitment, NoteCommitment};
 
 /// Nullifier types and derivation.
 pub mod nullifier;

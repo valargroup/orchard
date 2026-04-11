@@ -212,5 +212,5 @@ pub fn derive_nullifier<
         .map(|res| res.extract_p())
 }
 
-pub use crate::circuit::commit_ivk::gadgets::commit_ivk;
+pub(in crate::circuit) use crate::circuit::commit_ivk::gadgets::commit_ivk;
 pub use crate::circuit::note_commit::gadgets::note_commit;

@@ -5,8 +5,8 @@ use pasta_curves::pallas;
 
 use super::{commit_ivk::CommitIvkChip, note_commit::NoteCommitChip};
 use crate::constants::{
-    NullifierK, OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull,
-    OrchardHashDomains, ValueCommitV,
+    NullifierK, OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull, OrchardHashDomains,
+    ValueCommitV,
 };
 use halo2_gadgets::{
     ecc::{

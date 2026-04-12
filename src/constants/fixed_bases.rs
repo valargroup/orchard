@@ -335,7 +335,10 @@ mod tests {
 
     #[test]
     fn nullifier_k_converts_to_base_field_enum() {
-        assert_eq!(OrchardBaseFieldBases::from(NullifierK), OrchardBaseFieldBases::NullifierK);
+        assert_eq!(
+            OrchardBaseFieldBases::from(NullifierK),
+            OrchardBaseFieldBases::NullifierK
+        );
     }
 
     /// Ensures that `OrchardShortScalarBases::SpendAuthGShort` routes to the

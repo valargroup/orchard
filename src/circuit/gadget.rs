@@ -186,8 +186,7 @@ pub(in crate::circuit) fn derive_nullifier<
     // `product` = [poseidon_hash(nk, rho) + psi] NullifierK.
     //
     let product = {
-        let nullifier_k = NullifierK;
-        let nullifier_k = FixedPointBaseField::from_inner(ecc_chip, nullifier_k.into());
+        let nullifier_k = FixedPointBaseField::from_inner(ecc_chip, NullifierK.into());
         nullifier_k.mul(
             layouter.namespace(|| "[poseidon_output + psi] NullifierK"),
             scalar,

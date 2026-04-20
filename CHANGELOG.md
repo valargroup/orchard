@@ -7,6 +7,11 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- Under the `circuit` feature, `orchard_internal::constants::OrchardBaseFieldBases`
+  and `OrchardShortScalarBases` expose `SpendAuthG` as a fixed base for
+  multiplication by base-field and short signed scalars.
+
 ### Changed
 - MSRV is now 1.85.1
 - Migrated from yanked `core2` library to `corez`

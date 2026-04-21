@@ -115,7 +115,7 @@ impl From<incrementalmerkletree::MerklePath<MerkleHashOrchard, 32>> for MerklePa
 
 impl MerklePath {
     /// Generates a dummy Merkle path for use in dummy spent notes.
-    pub(crate) fn dummy(mut rng: &mut impl RngCore) -> Self {
+    pub fn dummy(mut rng: &mut impl RngCore) -> Self {
         MerklePath {
             position: rng.next_u32(),
             auth_path: [(); MERKLE_DEPTH_ORCHARD]
@@ -182,8 +182,8 @@ impl MerkleHashOrchard {
         MerkleHashOrchard(value.inner())
     }
 
-    /// Only used in the circuit.
-    pub(crate) fn inner(&self) -> pallas::Base {
+    /// Returns the inner base field element.
+    pub fn inner(&self) -> pallas::Base {
         self.0
     }
 

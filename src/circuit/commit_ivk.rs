@@ -27,7 +27,8 @@ pub struct CommitIvkChip {
 }
 
 impl CommitIvkChip {
-    pub(in crate::circuit) fn configure(
+    /// Configures the chip's gate and column assignments.
+    pub fn configure(
         meta: &mut ConstraintSystem<pallas::Base>,
         advices: [Column<Advice>; 10],
     ) -> CommitIvkConfig {
@@ -222,12 +223,14 @@ impl CommitIvkChip {
         config
     }
 
-    pub(in crate::circuit) fn construct(config: CommitIvkConfig) -> Self {
+    /// Constructs the chip from a [`CommitIvkConfig`].
+    pub fn construct(config: CommitIvkConfig) -> Self {
         Self { config }
     }
 }
 
-pub(in crate::circuit) mod gadgets {
+/// Gadget functions for `CommitIvk` operations.
+pub mod gadgets {
     use halo2_gadgets::utilities::{
         lookup_range_check::{LookupRangeCheck, LookupRangeCheckConfig},
         RangeConstrained,
@@ -241,7 +244,7 @@ pub(in crate::circuit) mod gadgets {
     /// [Section 5.4.8.4 Sinsemilla commitments]: https://zips.z.cash/protocol/protocol.pdf#concretesinsemillacommit
     #[allow(non_snake_case)]
     #[allow(clippy::type_complexity)]
-    pub(in crate::circuit) fn commit_ivk(
+    pub fn commit_ivk(
         sinsemilla_chip: SinsemillaChip<
             OrchardHashDomains,
             OrchardCommitDomains,

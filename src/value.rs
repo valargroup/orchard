@@ -100,6 +100,8 @@ impl std::error::Error for BalanceError {}
 pub struct NoteValue(u64);
 
 impl NoteValue {
+    /// Returns a zero note value.
+    #[cfg_attr(feature = "unstable-voting-circuits", visibility::make(pub))]
     pub(crate) fn zero() -> Self {
         // Default for u64 is zero.
         Default::default()

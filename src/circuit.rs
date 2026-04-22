@@ -58,9 +58,17 @@ use halo2_gadgets::{
     utilities::lookup_range_check::{LookupRangeCheck, LookupRangeCheckConfig},
 };
 
+#[cfg(not(feature = "unstable-voting-circuits"))]
 mod commit_ivk;
+#[cfg(feature = "unstable-voting-circuits")]
+#[allow(missing_docs)]
+pub mod commit_ivk;
 pub mod gadget;
+#[cfg(not(feature = "unstable-voting-circuits"))]
 mod note_commit;
+#[cfg(feature = "unstable-voting-circuits")]
+#[allow(missing_docs)]
+pub mod note_commit;
 
 pub use crate::Proof;
 

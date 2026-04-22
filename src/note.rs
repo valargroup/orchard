@@ -20,10 +20,10 @@ pub(crate) mod commitment;
 #[cfg(feature = "unstable-voting-circuits")]
 #[allow(missing_docs)]
 pub mod commitment;
-#[cfg(not(feature = "unstable-voting-circuits"))]
-pub use self::commitment::{ExtractedNoteCommitment, NoteCommitment};
 #[cfg(feature = "unstable-voting-circuits")]
 pub use self::commitment::{ExtractedNoteCommitment, NoteCommitTrapdoor, NoteCommitment};
+#[cfg(not(feature = "unstable-voting-circuits"))]
+pub use self::commitment::{ExtractedNoteCommitment, NoteCommitment};
 
 #[cfg(not(feature = "unstable-voting-circuits"))]
 pub(crate) mod nullifier;

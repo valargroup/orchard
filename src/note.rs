@@ -11,7 +11,7 @@ use subtle::CtOption;
 use crate::{
     keys::{EphemeralSecretKey, FullViewingKey, Scope, SpendingKey},
     spec::{to_base, to_scalar, NonZeroPallasScalar, PrfExpand},
-    value::NoteValue,
+    value::{NoteValue, NOTE_VALUE_ZERO},
     Address,
 };
 
@@ -230,7 +230,7 @@ impl Note {
 
         let note = Note::new(
             recipient,
-            NoteValue::zero(),
+            NOTE_VALUE_ZERO,
             rho.unwrap_or_else(|| Rho::from_nf_old(Nullifier::dummy(rng))),
             rng,
         );

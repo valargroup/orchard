@@ -18,7 +18,7 @@ and this project adheres to Rust's notion of
   variants; existing `From<NullifierK>` and `From<ValueCommitV>` conversions
   continue to route correctly. Reachable externally only under the
   `unstable-voting-circuits` feature.
-- `orchard::value::NOTE_VALUE_ZERO`, a `pub const NoteValue` equal to zero.
+- `orchard::value::NOTE_VALUE_ZERO`, a `const NoteValue` equal to zero.
   Replaces the previous crate-private `NoteValue::zero()` constructor at all
   internal call sites, and is now exposed to downstream consumers.
 

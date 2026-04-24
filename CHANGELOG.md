@@ -7,6 +7,11 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- `orchard::value::NOTE_VALUE_ZERO`, a `pub const NoteValue` equal to zero.
+  Replaces the previous crate-private `NoteValue::zero()` constructor at all
+  internal call sites, and is now exposed to downstream consumers.
+
 ## [0.13.0] - 2026-04-22
 
 ### Added

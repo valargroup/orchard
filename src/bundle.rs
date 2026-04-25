@@ -538,7 +538,7 @@ pub mod testing {
 
     use crate::{
         primitives::redpallas::{self, testing::arb_binding_signing_key},
-        value::{testing::arb_note_value_bounded, ValueSum, MAX_NOTE_VALUE, NOTE_VALUE_ZERO},
+        value::{testing::arb_note_value_bounded, NoteValue, ValueSum, MAX_NOTE_VALUE},
         Anchor, Proof,
     };
 
@@ -557,14 +557,14 @@ pub mod testing {
         let spend_value_gen = if flags.spends_enabled {
             Strategy::boxed(arb_note_value_bounded(MAX_NOTE_VALUE / n_actions as u64))
         } else {
-            Strategy::boxed(Just(NOTE_VALUE_ZERO))
+            Strategy::boxed(Just(NoteValue::ZERO))
         };
 
         spend_value_gen.prop_flat_map(move |spend_value| {
             let output_value_gen = if flags.outputs_enabled {
                 Strategy::boxed(arb_note_value_bounded(MAX_NOTE_VALUE / n_actions as u64))
             } else {
-                Strategy::boxed(Just(NOTE_VALUE_ZERO))
+                Strategy::boxed(Just(NoteValue::ZERO))
             };
 
             output_value_gen.prop_flat_map(move |output_value| {
@@ -582,14 +582,14 @@ pub mod testing {
         let spend_value_gen = if flags.spends_enabled {
             Strategy::boxed(arb_note_value_bounded(MAX_NOTE_VALUE / n_actions as u64))
         } else {
-            Strategy::boxed(Just(NOTE_VALUE_ZERO))
+            Strategy::boxed(Just(NoteValue::ZERO))
         };
 
         spend_value_gen.prop_flat_map(move |spend_value| {
             let output_value_gen = if flags.outputs_enabled {
                 Strategy::boxed(arb_note_value_bounded(MAX_NOTE_VALUE / n_actions as u64))
             } else {
-                Strategy::boxed(Just(NOTE_VALUE_ZERO))
+                Strategy::boxed(Just(NoteValue::ZERO))
             };
 
             output_value_gen.prop_flat_map(move |output_value| {

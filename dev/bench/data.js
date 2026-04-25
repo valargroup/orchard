@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776961642179,
+  "lastUpdate": 1777093260737,
   "repoUrl": "https://github.com/valargroup/orchard",
   "entries": {
     "Orchard Benchmarks": [
@@ -899,6 +899,186 @@ window.BENCHMARK_DATA = {
             "name": "default_address",
             "value": 488991,
             "range": "± 688",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "ewillbefull@gmail.com",
+            "name": "Sean Bowe",
+            "username": "ebfull"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": false,
+          "id": "d05a1f618854846ceaf4f5d87bc8ccaf157f3618",
+          "message": "Merge pull request #488 from valargroup/adam/visibility-widening\n\nfeat: add unstable-voting-circuits feature to widen internals",
+          "timestamp": "2026-04-23T18:01:35-06:00",
+          "tree_id": "6a4185783e9dc117038c0f7e6778dfd65dcff34f",
+          "url": "https://github.com/valargroup/orchard/commit/d05a1f618854846ceaf4f5d87bc8ccaf157f3618"
+        },
+        "date": 1777093260059,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "proving/bundle/1",
+            "value": 2772853013,
+            "range": "± 234479672",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "proving/bundle/2",
+            "value": 2721866968,
+            "range": "± 5942594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "proving/bundle/3",
+            "value": 3885864067,
+            "range": "± 14557590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "proving/bundle/4",
+            "value": 5115690279,
+            "range": "± 47967036",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verifying/bundle/1",
+            "value": 22224566,
+            "range": "± 188277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verifying/bundle/2",
+            "value": 22272452,
+            "range": "± 275103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verifying/bundle/3",
+            "value": 25806440,
+            "range": "± 242458",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verifying/bundle/4",
+            "value": 29100550,
+            "range": "± 367506",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "note-decryption/valid",
+            "value": 1579363,
+            "range": "± 18486",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "note-decryption/invalid",
+            "value": 134117,
+            "range": "± 1179",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "note-decryption/compact-valid",
+            "value": 1580819,
+            "range": "± 30495",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "compact-note-decryption/invalid",
+            "value": 1419832351,
+            "range": "± 6323243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/valid/10",
+            "value": 16694874,
+            "range": "± 189788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/invalid/10",
+            "value": 2287052,
+            "range": "± 53509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/compact-valid/10",
+            "value": 16670433,
+            "range": "± 287500",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/compact-invalid/10",
+            "value": 2246929,
+            "range": "± 7345",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/valid/50",
+            "value": 83437825,
+            "range": "± 1261539",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/invalid/50",
+            "value": 11377489,
+            "range": "± 27710",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/compact-valid/50",
+            "value": 83285360,
+            "range": "± 1998703",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/compact-invalid/50",
+            "value": 11174923,
+            "range": "± 15555",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/valid/100",
+            "value": 166812990,
+            "range": "± 139924",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/invalid/100",
+            "value": 22760316,
+            "range": "± 548953",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/compact-valid/100",
+            "value": 166508965,
+            "range": "± 2054290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "batch-note-decryption/compact-invalid/100",
+            "value": 22339019,
+            "range": "± 57006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "derive_fvk",
+            "value": 484684,
+            "range": "± 5495",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "default_address",
+            "value": 518694,
+            "range": "± 12075",
             "unit": "ns/iter"
           }
         ]

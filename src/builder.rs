@@ -20,10 +20,7 @@ use crate::{
     note_encryption::OrchardNoteEncryption,
     primitives::redpallas::{self, Binding, SpendAuth},
     tree::{Anchor, MerklePath},
-    value::{
-        self, BalanceError, NoteValue, ValueCommitTrapdoor, ValueCommitment, ValueSum,
-        NOTE_VALUE_ZERO,
-    },
+    value::{self, BalanceError, NoteValue, ValueCommitTrapdoor, ValueCommitment, ValueSum},
     Proof,
 };
 
@@ -279,7 +276,7 @@ impl SpendInfo {
     }
 
     fn has_matching_anchor(&self, anchor: &Anchor) -> bool {
-        if self.note.value() == NOTE_VALUE_ZERO {
+        if self.note.value() == NoteValue::ZERO {
             true
         } else {
             let cm = self.note.commitment();
@@ -363,7 +360,7 @@ impl OutputInfo {
         let fvk: FullViewingKey = (&SpendingKey::random(rng)).into();
         let recipient = fvk.address_at(0u32, Scope::External);
 
-        Self::new(None, recipient, NOTE_VALUE_ZERO, [0u8; 512])
+        Self::new(None, recipient, NoteValue::ZERO, [0u8; 512])
     }
 
     /// Builds the output half of an action.
@@ -642,11 +639,11 @@ impl Builder {
         let value_balance = self
             .spends
             .iter()
-            .map(|spend| spend.note.value() - NOTE_VALUE_ZERO)
+            .map(|spend| spend.note.value() - NoteValue::ZERO)
             .chain(
                 self.outputs
                     .iter()
-                    .map(|output| NOTE_VALUE_ZERO - output.value),
+                    .map(|output| NoteValue::ZERO - output.value),
             )
             .try_fold(ValueSum::zero(), |acc, note_value| acc + note_value)
             .ok_or(BalanceError::Overflow)?;

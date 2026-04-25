@@ -63,11 +63,6 @@ use crate::{
 /// Maximum note value.
 pub const MAX_NOTE_VALUE: u64 = u64::MAX;
 
-/// The zero note value.
-///
-/// Equivalent to `NoteValue::from_raw(0)`.
-pub const NOTE_VALUE_ZERO: NoteValue = NoteValue(0);
-
 /// The valid range of the scalar multiplication used in ValueCommit^Orchard.
 ///
 /// Defined in a note in [Zcash Protocol Spec § 4.17.4: Action Statement (Orchard)][actionstatement].
@@ -105,6 +100,11 @@ impl std::error::Error for BalanceError {}
 pub struct NoteValue(u64);
 
 impl NoteValue {
+    /// The zero note value.
+    ///
+    /// Equivalent to `NoteValue::from_raw(0)`.
+    pub const ZERO: Self = NoteValue(0);
+
     /// Returns the raw underlying value.
     pub fn inner(&self) -> u64 {
         self.0

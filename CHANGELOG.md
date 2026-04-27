@@ -8,32 +8,32 @@ and this project adheres to Rust's notion of
 ## [Unreleased]
 
 ### Changed
-- The following APIs have changed or been made available behind the
-  `unstable-voting-circuits` feature flag, and are not covered by the
-  crate's semver stability guarantees and may change in any future
-  release:
-  - `orchard::constants::OrchardFixedBases` has been reorganized to wrap
-    two new fixed-base enums, each adding `SpendAuthG` as a supported
-    generator alongside the existing `NullifierK` / `ValueCommitV`
-    generators. Existing `From<NullifierK>` and `From<ValueCommitV>`
-    conversions to `OrchardFixedBases` are preserved.
-  - `orchard::constants::OrchardBaseFieldBases`: fixed bases for scalar
-    multiplication by a base-field scalar.
-  - `orchard::constants::OrchardShortScalarBases`: fixed bases for scalar
-    multiplication by a short signed scalar.
+- `unstable-voting-circuits`-only:
+  - `orchard::constants::OrchardFixedBases` is now a unit struct rather than a
+    3-variant enum. It is a trait carrier for the halo2_gadgets `FixedPoints`
+    impl and was never constructed as a value; the concrete fixed bases live
+    in `OrchardFixedBasesFull`, `OrchardBaseFieldBases`, and
+    `OrchardShortScalarBases`, which are unchanged.
 
-## [0.13.0] - 2026-04-22
+### Removed
+- `unstable-voting-circuits`-only:
+  - The five dead `From<X> for OrchardFixedBases` conversions (from
+    `OrchardFixedBasesFull`, `NullifierK`, `ValueCommitV`,
+    `OrchardBaseFieldBases`, `OrchardShortScalarBases`). None were reachable;
+    in-circuit dispatch goes through the per-slot enums.
+  - `impl FixedPoint<pallas::Affine> for NullifierK` and
+    `impl FixedPoint<pallas::Affine> for ValueCommitV`. After the 0.13.1
+    enum refactor, dispatch routes through `OrchardBaseFieldBases::NullifierK`
+    and `OrchardShortScalarBases::ValueCommitV`, leaving the standalone
+    unit-struct impls dead.
+
+## [0.13.1] - 2026-04-27
 
 ### Added
-- `orchard::primitives::redpallas::VerificationKey<T>::is_identity`, which
-  returns `true` if the verification key is the identity `pallas::Point`.
-- `orchard::primitives::redpallas::testing::arb_valid_spendauth_keypair`
-  (under the `test-dependencies` feature): a uniformly-distributed valid
-  `(rsk, rk)` key pair with non-identity `rk`.
 - `orchard::{L_ORCHARD_BASE, L_ORCHARD_SCALAR, L_VALUE}`, the bit-length
   parameters of the Orchard base field, scalar field, and value encoding
   as defined in the Zcash protocol specification.
-- `orchard::value::NoteValue::zero`, equivalent to `NoteValue::from_raw(0)`.
+- `orchard::value::NoteValue::ZERO`, a `const NoteValue` equal to zero.
 - The following modules and APIs are available behind the
   `unstable-voting-circuits` feature flag to support downstream
   voting-circuit development. These temporary APIs are not covered by the
@@ -49,6 +49,16 @@ and this project adheres to Rust's notion of
     `AddChip::{configure, construct}`,
     `CommitIvkChip::{configure, construct}`,
     `NoteCommitChip::{configure, construct}`.
+  - Fixed bases: `orchard::constants::OrchardFixedBases` has three
+    variants: `Full(OrchardFixedBasesFull)` for full-width scalar
+    multiplication, `Base(OrchardBaseFieldBases)` for base-field
+    scalars, and `Short(OrchardShortScalarBases)` for short signed
+    scalars. `OrchardBaseFieldBases` covers `NullifierK` and
+    `SpendAuthGBase`; `OrchardShortScalarBases` covers `ValueCommitV`
+    and `SpendAuthGShort`. `From<NullifierK>`, `From<ValueCommitV>`,
+    `From<OrchardFixedBasesFull>`, `From<OrchardBaseFieldBases>`, and
+    `From<OrchardShortScalarBases>` conversions to `OrchardFixedBases`
+    are provided.
   - Key, note, tree, and value APIs: `SpendingKey::random`,
     `SpendAuthorizingKey::derive_inner`, `NullifierDerivingKey` and
     `CommitIvkRandomness` and their `inner` methods,
@@ -60,6 +70,15 @@ and this project adheres to Rust's notion of
     `ExtractedNoteCommitment::inner`, `Nullifier::{from_inner, inner}`,
     `NonIdentityPallasPoint` and `NonIdentityPallasPoint::from_bytes`,
     `MerklePath::dummy`, and `MerkleHashOrchard::inner`.
+
+## [0.13.0] - 2026-04-22
+
+### Added
+- `orchard::primitives::redpallas::VerificationKey<T>::is_identity`, which
+  returns `true` if the verification key is the identity `pallas::Point`.
+- `orchard::primitives::redpallas::testing::arb_valid_spendauth_keypair`
+  (under the `test-dependencies` feature): a uniformly-distributed valid
+  `(rsk, rk)` key pair with non-identity `rk`.
 
 ### Changed
 - MSRV is now 1.85.1

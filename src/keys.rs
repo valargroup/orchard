@@ -471,6 +471,12 @@ impl FullViewingKey {
         }
     }
 
+    /// Returns the scalar form of the incoming viewing key for `scope`.
+    #[cfg_attr(feature = "unstable-voting-circuits", visibility::make(pub))]
+    pub(crate) fn ivk_scalar(&self, scope: Scope) -> pallas::Scalar {
+        *self.to_ivk(scope).ivk.0
+    }
+
     /// Derives an `OutgoingViewingKey` for this full viewing key.
     pub fn to_ovk(&self, scope: Scope) -> OutgoingViewingKey {
         match scope {

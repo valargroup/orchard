@@ -813,7 +813,10 @@ mod tests {
                 let sinsemilla_chip = SinsemillaChip::construct(sinsemilla_config);
 
                 // Construct an ECC chip
-                let ecc_chip = EccChip::construct(ecc_config);
+                let ecc_chip = EccChip::construct(
+                    ecc_config,
+                    halo2_gadgets::ecc::CircuitVersion::AnchoredBase,
+                );
 
                 let commit_ivk_chip = CommitIvkChip::construct(commit_ivk_config.clone());
 

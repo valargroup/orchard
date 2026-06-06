@@ -481,7 +481,10 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<pallas::Base>,
             ) -> Result<(), Error> {
-                let chip = EccChip::construct(config.ecc.clone());
+                let chip = EccChip::construct(
+                    config.ecc.clone(),
+                    halo2_gadgets::ecc::CircuitVersion::AnchoredBase,
+                );
 
                 // The fixed-base ECC gadgets expect this 10-bit lookup table to
                 // be populated before any windowed multiplication can succeed.

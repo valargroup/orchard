@@ -2175,7 +2175,10 @@ mod tests {
                     SinsemillaChip::construct(note_commit_config.sinsemilla_config.clone());
 
                 // Construct an ECC chip
-                let ecc_chip = EccChip::construct(ecc_config);
+                let ecc_chip = EccChip::construct(
+                    ecc_config,
+                    halo2_gadgets::ecc::CircuitVersion::AnchoredBase,
+                );
 
                 // Construct a NoteCommit chip
                 let note_commit_chip = NoteCommitChip::construct(note_commit_config.clone());

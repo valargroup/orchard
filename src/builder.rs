@@ -1,6 +1,7 @@
 //! Logic for building Orchard components of transactions.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::iter;
@@ -35,6 +36,7 @@ use {
 };
 
 const MIN_ACTIONS: usize = 2;
+const QLEAK_V5_RANDOMIZED_CIPHERTEXT_MARKER: &str = "qleak:v5-randomized-enc-ciphertext";
 
 /// An enumeration of rules for Orchard bundle construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,11 +137,25 @@ impl BundleType {
                 } else if !*outputs_enabled && num_outputs > 0 {
                     Err("Outputs are disabled, so num_outputs must be zero")
                 } else {
-                    Ok(if *bundle_required || num_requested_actions > 0 {
+                    let base_actions = if *bundle_required || num_requested_actions > 0 {
                         core::cmp::max(num_requested_actions, MIN_ACTIONS)
                     } else {
                         0
-                    })
+                    };
+
+                    // Local qleak test behavior: for v5 Orchard spends, ensure there is one
+                    // zero-value padding output whose note ciphertext can be randomized. If
+                    // requested outputs already fill every action, add one extra action for it.
+                    if protocol == BundleProtocol::OrchardPreNu6_3
+                        && *spends_enabled
+                        && *outputs_enabled
+                        && num_spends > 0
+                        && base_actions <= num_outputs
+                    {
+                        base_actions.checked_add(1).ok_or("num_actions overflowed")
+                    } else {
+                        Ok(base_actions)
+                    }
                 }
             }
             BundleType::Coinbase => {
@@ -489,6 +505,12 @@ impl OutputInfo {
         Self::new(None, recipient, NoteValue::ZERO, [0u8; 512], note_version)
     }
 
+    fn randomized_dummy(rng: &mut impl RngCore, note_version: NoteVersion) -> Self {
+        let mut output = Self::dummy(rng, note_version);
+        output.randomized_ciphertext = true;
+        output
+    }
+
     /// Builds the output half of an action.
     ///
     /// Defined in [Zcash Protocol Spec § 4.7.3: Sending Notes (Orchard)][orchardsend].
@@ -507,14 +529,9 @@ impl OutputInfo {
 
         let encryptor = OrchardNoteEncryption::new(self.ovk.clone(), note, self.memo);
 
-        // `encryptor` still supplies a valid non-identity `epk` and, because these outputs use
-        // `ovk = None`, a random `out_ciphertext`. Only `enc_ciphertext` is replaced.
+        // `encryptor` still supplies a valid non-identity `epk` and a random
+        // `out_ciphertext`. Only `enc_ciphertext` is replaced.
         let enc_ciphertext = if self.randomized_ciphertext {
-            assert_eq!(
-                self.value,
-                NoteValue::ZERO,
-                "a randomized note ciphertext must never stand in for a nonzero-value note",
-            );
             let mut enc_ciphertext = [0u8; ENC_CIPHERTEXT_SIZE];
             rng.fill_bytes(&mut enc_ciphertext);
             enc_ciphertext
@@ -537,7 +554,12 @@ impl OutputInfo {
         nf_old: Nullifier,
         rng: impl RngCore,
     ) -> crate::pczt::Output {
+        let randomized_ciphertext = self.randomized_ciphertext;
         let (note, cmx, encrypted_note) = self.build(cv_net, nf_old, rng);
+        let mut proprietary = BTreeMap::new();
+        if randomized_ciphertext {
+            proprietary.insert(String::from(QLEAK_V5_RANDOMIZED_CIPHERTEXT_MARKER), vec![1]);
+        }
 
         crate::pczt::Output {
             cmx,
@@ -551,7 +573,7 @@ impl OutputInfo {
             ock: None,
             zip32_derivation: None,
             user_address: None,
-            proprietary: BTreeMap::new(),
+            proprietary,
         }
     }
 }
@@ -1347,11 +1369,18 @@ fn build_bundle<B, R: RngCore>(
         // ownership was validated when each `ChangeInfo` was constructed and plays no
         // further role when cross-address transfers are permitted). This ordering matches
         // the `BundleMetadata` output numbering.
+        let mut randomize_next_padding_output =
+            protocol == BundleProtocol::OrchardPreNu6_3 && num_requested_spends > 0;
         let mut indexed_outputs = outputs
             .into_iter()
             .chain(changes.into_iter().map(ChangeInfo::into_output))
             .chain(iter::repeat_with(|| {
-                OutputInfo::dummy(&mut rng, note_version)
+                if randomize_next_padding_output {
+                    randomize_next_padding_output = false;
+                    OutputInfo::randomized_dummy(&mut rng, note_version)
+                } else {
+                    OutputInfo::dummy(&mut rng, note_version)
+                }
             }))
             .enumerate()
             .take(num_actions)

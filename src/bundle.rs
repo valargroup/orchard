@@ -182,7 +182,7 @@ pub enum BundleFormat {
 }
 
 /// Orchard-specific flags.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Flags {
     /// Flag denoting whether Orchard spends are enabled in the transaction.
     ///
@@ -224,7 +224,7 @@ impl Flags {
     /// bundle must keep cross-address transfers enabled to pay an arbitrary recipient.
     ///
     /// [`BundleType::Coinbase`]: crate::builder::BundleType::Coinbase
-    pub(crate) const fn from_parts(spends_enabled: bool, outputs_enabled: bool) -> Self {
+    pub const fn from_parts(spends_enabled: bool, outputs_enabled: bool) -> Self {
         Flags::from_parts_with_cross_address(spends_enabled, outputs_enabled, true)
     }
 

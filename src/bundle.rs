@@ -1266,6 +1266,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn serde_round_trip_preserves_cross_address_bit_per_protocol() {
+        // At NU6.3 the cross-address bit (0b100) is the only flag-byte difference between
+        // Orchard (`enableCrossAddress = 0`) and Ironwood (`= 1`); before NU6.3 it is a
+        // reserved zero bit. Deriving `serde` on `Flags` must not disturb that bit, so for
+        // every protocol the value must survive a serde round-trip and re-encode to the
+        // same flag byte.
+        for protocol in [
+            BundleProtocol::OrchardPreNu6_2,
+            BundleProtocol::OrchardPreNu6_3,
+            BundleProtocol::OrchardPostNu6_3,
+            BundleProtocol::IronwoodPostNu6_3,
+        ] {
+            let format = protocol.bundle_format();
+            // The flags a typical spends+outputs bundle uses under this protocol.
+            let flags = if protocol.requires_cross_address_restriction() {
+                Flags::CROSS_ADDRESS_DISABLED
+            } else {
+                Flags::ENABLED
+            };
+
+            let byte = flags
+                .to_byte(format)
+                .expect("flags are encodable under their own format");
+
+            // Only NU6.3 Ironwood sets the cross-address bit; pre-NU6.3 and NU6.3 Orchard
+            // leave it clear (reserved / `enableCrossAddress = 0`).
+            assert_eq!(
+                byte & 0b100 != 0,
+                protocol == BundleProtocol::IronwoodPostNu6_3,
+                "unexpected cross-address bit for {protocol:?}"
+            );
+
+            // serde must round-trip the flags without changing the encoded byte.
+            let restored: Flags =
+                serde_json::from_str(&serde_json::to_string(&flags).unwrap()).unwrap();
+            assert_eq!(restored, flags, "serde changed the flags for {protocol:?}");
+            assert_eq!(
+                restored.to_byte(format),
+                Some(byte),
+                "serde changed the encoded flag byte for {protocol:?}"
+            );
+        }
+    }
+
+    #[test]
     fn nu6_3_flags_parsing_recognizes_cross_address_enabled() {
         for value in 0b100..=0b111 {
             let flags = Flags::from_byte(value, BundleFormat::Nu6_3).unwrap();

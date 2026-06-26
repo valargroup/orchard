@@ -357,6 +357,15 @@ pub enum ParseError {
     UnexpectedFlagBitsSet,
     /// An invalid `note_version` was provided.
     InvalidNoteVersion,
+    /// A derived field that was omitted from the PCZT could not be recomputed from the
+    /// note's component fields. Wraps the [`VerifyError`](super::VerifyError) describing
+    /// which component was missing or invalid.
+    ///
+    /// Note: there is deliberately no `From<VerifyError> for ParseError` conversion; callers
+    /// wrap explicitly via `ParseError::Recompute`. A blanket `From` would make the `?`
+    /// operator ambiguous in existing parse code (two `impl`s satisfying
+    /// `ParseError: From<_>`).
+    Recompute(super::VerifyError),
 }
 
 impl fmt::Display for ParseError {
@@ -384,6 +393,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnexpectedFlagBitsSet => write!(f, "`flags` field had unexpected bits set"),
             ParseError::InvalidNoteVersion => write!(f, "invalid `note_version`"),
+            ParseError::Recompute(e) => {
+                write!(f, "could not recompute an omitted derived field: {e}")
+            }
         }
     }
 }

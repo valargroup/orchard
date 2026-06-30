@@ -24,7 +24,7 @@ mod parse;
 pub use parse::ParseError;
 
 mod verify;
-pub use verify::{recompute, VerifyError};
+pub use verify::VerifyError;
 
 mod io_finalizer;
 pub use io_finalizer::IoFinalizerError;
@@ -792,6 +792,252 @@ mod tests {
         assert_eq!(bundle.value_balance(), &0);
         // We can successfully bind the bundle.
         bundle.apply_binding_signature(sighash, rng).unwrap();
+    }
+
+    /// Proves the Signer-only lean parse ([`super::Spend::parse_for_signing`] /
+    /// [`super::Action::parse_for_signing`]) produces a byte-identical `spend_auth_sig` to
+    /// the full parse ([`super::Spend::parse`] / [`super::Action::parse`]).
+    ///
+    /// We build one real Orchard action through the full role pipeline (Creator,
+    /// Constructor, IO Finalizer, Prover), capture the raw on-the-wire component bytes of
+    /// its spend (including the `fvk`), then re-parse those identical bytes twice: once with
+    /// the full parse (which derives the FVK) and once with the lean parse (which skips it).
+    /// Signing both with the same `ask`, `sighash`, and an identically-seeded RNG must yield
+    /// the same 64-byte signature, because the signature depends only on `alpha`, `rk`, and
+    /// `ask`, never on `fvk`.
+    #[test]
+    fn lean_parse_signs_identically_to_full_parse() {
+        use super::{Action, Spend};
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let pool_restrictions = BundlePoolRestrictions::OrchardNu6_2Only;
+        let pk = ProvingKey::build(pool_restrictions.circuit_version());
+        let mut rng = OsRng;
+
+        // Derive the spending key material (the seed-derived `ask` the signer uses).
+        let sk = SpendingKey::random(&mut rng);
+        let ask = SpendAuthorizingKey::from(&sk);
+        let fvk = FullViewingKey::from(&sk);
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        // Pretend we already received a note.
+        let value = NoteValue::from_raw(15_000);
+        let note = {
+            let rho = Rho::from_bytes(&pallas::Base::random(&mut rng).to_repr()).unwrap();
+            loop {
+                if let Some(note) = Note::from_parts(
+                    recipient,
+                    value,
+                    rho,
+                    RandomSeed::random(&mut rng, &rho),
+                    pool_restrictions.note_version(),
+                )
+                .into_option()
+                {
+                    break note;
+                }
+            }
+        };
+
+        // Single-leaf tree, for the witness/anchor.
+        let (anchor, merkle_path) = {
+            let cmx: ExtractedNoteCommitment = note.commitment().into();
+            let leaf = MerkleHashOrchard::from_cmx(&cmx);
+            let mut tree: ShardTree<MemoryShardStore<MerkleHashOrchard, u32>, 32, 16> =
+                ShardTree::new(MemoryShardStore::empty(), 100);
+            tree.append(
+                leaf,
+                Retention::Checkpoint {
+                    id: 0,
+                    marking: Marking::Marked,
+                },
+            )
+            .unwrap();
+            let root = tree.root_at_checkpoint_id(&0).unwrap().unwrap();
+            let position = tree.max_leaf_position(None).unwrap().unwrap();
+            let merkle_path = tree
+                .witness_at_checkpoint_id(position, &0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(root, merkle_path.root(MerkleHashOrchard::from_cmx(&cmx)));
+            (root.into(), merkle_path)
+        };
+
+        // Creator + Constructor.
+        let mut builder = Builder::new(pool_restrictions, BundleType::DEFAULT, anchor);
+        builder
+            .add_spend(fvk.clone(), note, merkle_path.into())
+            .unwrap();
+        builder
+            .add_output(None, recipient, NoteValue::from_raw(10_000), [0u8; 512])
+            .unwrap();
+        builder
+            .add_output(
+                Some(fvk.to_ovk(Scope::Internal)),
+                fvk.address_at(0u32, Scope::Internal),
+                NoteValue::from_raw(5_000),
+                [0u8; 512],
+            )
+            .unwrap();
+        let (mut pczt_bundle, _meta) = builder.build_for_pczt(&mut rng).unwrap();
+
+        // IO Finalizer (sets `alpha`/`rk` consistency) + Prover.
+        let sighash = [0u8; 32];
+        pczt_bundle.finalize_io(sighash, rng).unwrap();
+        pczt_bundle.create_proof(&pk, rng).unwrap();
+
+        // Find the real spend action (the one whose `ask` we hold) and capture the raw
+        // on-the-wire component bytes of its spend. The `fvk` IS present on the wire here,
+        // so the full parse will do the FVK derivation and the lean parse will skip it.
+        let action = pczt_bundle
+            .actions()
+            .iter()
+            .find(|a| a.spend().value() == &Some(value))
+            .expect("the real spend is present");
+        let spend = action.spend();
+
+        // Sanity: this spend really carries an `fvk` on the wire (otherwise the test would
+        // be vacuous because both parses would skip the derivation).
+        assert!(
+            spend.fvk().is_some(),
+            "test precondition: the captured spend must carry an fvk on the wire",
+        );
+        // Sanity: `alpha` and a real (non-`None`) signature randomizer are present.
+        assert!(spend.alpha().is_some(), "alpha must be set after IO finalize");
+
+        // Raw component bytes (the same encoding `pczt::Bundle::serialize_from` produces).
+        let cv_net_bytes: [u8; 32] = action.cv_net().to_bytes();
+        let nf_bytes: [u8; 32] = spend.nullifier().to_bytes();
+        let rk_bytes: [u8; 32] = spend.rk().into();
+        let recipient_bytes = spend.recipient().map(|r| r.to_raw_address_bytes());
+        let value_raw = spend.value().map(|v| v.inner());
+        let rho_bytes = spend.rho().map(|rho| rho.to_bytes());
+        let rseed_bytes = spend.rseed().map(|rseed| *rseed.as_bytes());
+        let fvk_bytes = spend.fvk().as_ref().map(|fvk| fvk.to_bytes());
+        let witness_bytes = spend.witness().as_ref().map(|witness| {
+            (
+                u32::try_from(u64::from(witness.position())).unwrap(),
+                witness
+                    .auth_path()
+                    .iter()
+                    .map(|node| node.to_bytes())
+                    .collect::<alloc::vec::Vec<_>>()[..]
+                    .try_into()
+                    .expect("path is length 32"),
+            )
+        });
+        let alpha_bytes = spend.alpha().map(|alpha| alpha.to_repr());
+        let note_version = *spend.note_version();
+
+        // Build the spend's component bytes once, and a helper to parse with either path.
+        // The output half is irrelevant to signing but is required to assemble an `Action`;
+        // reuse the real output's bytes through the full output parse for both branches.
+        let output = action.output();
+        let build_output = || {
+            super::Output::parse(
+                *spend.nullifier(),
+                output.cmx().to_bytes(),
+                output.encrypted_note().epk_bytes,
+                output.encrypted_note().enc_ciphertext.to_vec(),
+                output.encrypted_note().out_ciphertext.to_vec(),
+                output.recipient().map(|r| r.to_raw_address_bytes()),
+                output.value().map(|v| v.inner()),
+                output.rseed().map(|rseed| *rseed.as_bytes()),
+                output.ock().as_ref().map(|ock| ock.0),
+                None,
+                output.user_address().clone(),
+                *output.note_version(),
+                output.proprietary().clone(),
+            )
+            .expect("output re-parses")
+        };
+        let rcv_bytes = action.rcv().as_ref().map(|rcv| rcv.to_bytes());
+
+        // === FULL parse path (derives the FVK) ===
+        let full_spend = Spend::parse(
+            nf_bytes,
+            rk_bytes,
+            None,
+            recipient_bytes,
+            value_raw,
+            rho_bytes,
+            rseed_bytes,
+            fvk_bytes,
+            witness_bytes,
+            alpha_bytes,
+            None,
+            None,
+            note_version,
+            alloc::collections::BTreeMap::new(),
+        )
+        .expect("full spend parse");
+        assert!(
+            full_spend.fvk().is_some(),
+            "full parse must derive the fvk",
+        );
+        let mut full_action =
+            Action::parse(cv_net_bytes, full_spend, build_output(), rcv_bytes).unwrap();
+
+        // === LEAN parse path (skips the FVK) ===
+        let lean_spend = Spend::parse_for_signing(
+            nf_bytes,
+            rk_bytes,
+            None,
+            recipient_bytes,
+            value_raw,
+            rho_bytes,
+            rseed_bytes,
+            fvk_bytes,
+            witness_bytes,
+            alpha_bytes,
+            None,
+            None,
+            note_version,
+            alloc::collections::BTreeMap::new(),
+        )
+        .expect("lean spend parse");
+        assert!(
+            lean_spend.fvk().is_none(),
+            "lean parse must omit the fvk (the whole point)",
+        );
+        let mut lean_action =
+            Action::parse_for_signing(cv_net_bytes, lean_spend, build_output(), rcv_bytes).unwrap();
+
+        // Sign both with the SAME ask, sighash, and an identically-seeded RNG. RedPallas
+        // signing is randomized, so the RNGs must match for the signatures to be comparable.
+        let seed = [7u8; 32];
+        full_action
+            .sign(sighash, &ask, StdRng::from_seed(seed))
+            .expect("full-parsed action signs");
+        lean_action
+            .sign(sighash, &ask, StdRng::from_seed(seed))
+            .expect("lean-parsed action signs");
+
+        let full_sig: [u8; 64] = (&full_action
+            .spend()
+            .spend_auth_sig()
+            .clone()
+            .expect("full action signed"))
+            .into();
+        let lean_sig: [u8; 64] = (&lean_action
+            .spend()
+            .spend_auth_sig()
+            .clone()
+            .expect("lean action signed"))
+            .into();
+
+        assert_eq!(
+            full_sig, lean_sig,
+            "lean-parsed signature must be byte-identical to the full-parsed signature",
+        );
+
+        // And both must verify against `rk` (defends against two matching-but-wrong sigs).
+        full_action
+            .apply_signature(
+                sighash,
+                redpallas::Signature::<SpendAuth>::from(lean_sig),
+            )
+            .expect("the lean signature verifies against the full action's rk");
     }
 
     #[test]

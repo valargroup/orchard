@@ -29,6 +29,10 @@ impl Bundle {
     /// See [`BundlePoolRestrictions`] for the choice of `pool_restrictions`.
     ///
     /// `value_sum` is represented as `(magnitude, is_negative)`.
+    ///
+    /// The `actions` must have been parsed via [`Action::parse`] (the full parse). This is
+    /// the parse used by every role except the low-level Signer, and it always derives each
+    /// spend's [`FullViewingKey`].
     pub fn parse(
         actions: Vec<Action>,
         flags: u8,
@@ -80,10 +84,45 @@ impl Bundle {
             bsk,
         })
     }
+
+    /// Parses a PCZT bundle for the **Signer role only**, from `actions` parsed via
+    /// [`Action::parse_for_signing`].
+    ///
+    /// The bundle-level fields (`flags`, `value_sum`, `anchor`, `zkproof`, `bsk`) are parsed
+    /// identically to [`Bundle::parse`]; the only difference is that each action's spend
+    /// omits its [`FullViewingKey`] (see [`Spend::parse_for_signing`] for the invariant).
+    /// The resulting bundle is usable for [`Action::sign`](super::Action::sign) but MUST NOT
+    /// be passed to the Verifier check path, the Prover, or any `fvk`-preserving
+    /// serialization.
+    pub fn parse_for_signing(
+        actions: Vec<Action>,
+        flags: u8,
+        pool_restrictions: BundlePoolRestrictions,
+        value_sum: (u64, bool),
+        anchor: [u8; 32],
+        zkproof: Option<Vec<u8>>,
+        bsk: Option<[u8; 32]>,
+    ) -> Result<Self, ParseError> {
+        // The bundle-level parse does no FVK work; the leanness lives entirely in the
+        // per-spend parse that produced `actions`. Delegating keeps the two in lockstep.
+        Self::parse(
+            actions,
+            flags,
+            pool_restrictions,
+            value_sum,
+            anchor,
+            zkproof,
+            bsk,
+        )
+    }
 }
 
 impl Action {
     /// Parses a PCZT action from its component parts.
+    ///
+    /// This performs the full parse: the `spend` must have been parsed via the full
+    /// [`Spend::parse`] (which derives the [`FullViewingKey`]). Every role except the
+    /// low-level Signer uses this entry point.
     pub fn parse(
         cv_net: [u8; 32],
         spend: Spend,
@@ -109,10 +148,39 @@ impl Action {
             rcv,
         })
     }
+
+    /// Parses a PCZT action for the **Signer role only**, skipping the spend's
+    /// [`FullViewingKey`] derivation.
+    ///
+    /// This is identical to [`Action::parse`] except that `spend` must have been parsed via
+    /// [`Spend::parse_for_signing`], leaving `spend.fvk` as `None`. See the invariant
+    /// documented on [`Spend::parse_for_signing`].
+    ///
+    /// The resulting [`Action`] is fully usable for signing (its `spend` retains `alpha`,
+    /// `rk`, and the spend-authorizing-key path), but it MUST NOT be passed to the Verifier
+    /// check path, the Prover, or any serialization that needs `fvk`.
+    pub fn parse_for_signing(
+        cv_net: [u8; 32],
+        spend: Spend,
+        output: Output,
+        rcv: Option<[u8; 32]>,
+    ) -> Result<Self, ParseError> {
+        // Sharing the same body as `parse` is fine: the FVK skip happens inside
+        // `Spend::parse_for_signing`, not here.
+        Self::parse(cv_net, spend, output, rcv)
+    }
 }
 
 impl Spend {
     /// Parses a PCZT spend from its component parts.
+    ///
+    /// This is the **full** parse used by every role except the low-level Signer: when
+    /// `fvk` is provided on the wire, it derives the [`FullViewingKey`] via
+    /// [`FullViewingKey::from_bytes`] (a relatively expensive operation involving Pallas
+    /// point decompression and two `commit_ivk` Sinsemilla hashes).
+    ///
+    /// The byte-for-byte behaviour of this method is part of the Verifier/check contract and
+    /// must not change. The Signer-only lean variant lives in [`Spend::parse_for_signing`].
     #[allow(clippy::too_many_arguments)]
     pub fn parse(
         nullifier: [u8; 32],
@@ -129,6 +197,108 @@ impl Spend {
         dummy_sk: Option<[u8; 32]>,
         note_version: NoteVersion,
         proprietary: BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, ParseError> {
+        Self::parse_inner(
+            nullifier,
+            rk,
+            spend_auth_sig,
+            recipient,
+            value,
+            rho,
+            rseed,
+            fvk,
+            witness,
+            alpha,
+            zip32_derivation,
+            dummy_sk,
+            note_version,
+            proprietary,
+            false,
+        )
+    }
+
+    /// Parses a PCZT spend for the **Signer role only**, deliberately skipping the
+    /// [`FullViewingKey`] derivation.
+    ///
+    /// The resulting `Spend` has `fvk: None` even when an `fvk` was present on the wire. It
+    /// retains everything the spend-authorization signature depends on (`rk`, `alpha`, and
+    /// the nullifier), so [`Action::sign`](super::Action::sign) produces a byte-identical
+    /// `spend_auth_sig` to one produced from a full parse.
+    ///
+    /// # Invariant (why this is sound)
+    ///
+    /// This lean parse omits FVK derivation. It is only valid because
+    /// [`Action::sign`](super::Action::sign) never reads `spend.fvk` (it reads only `alpha`,
+    /// `rk`, and the seed-derived `ask`), and because signing always follows a full
+    /// pre-swipe Verifier check (`verify_nullifier` / `verify_rk`) performed over the
+    /// identical PCZT bytes, which DOES derive and check the FVK. The signer therefore does
+    /// not need to re-derive it.
+    ///
+    /// A `Spend` produced by this method MUST NOT be:
+    /// - passed to the Verifier check path ([`verify_nullifier`](super::Spend::verify_nullifier),
+    ///   [`verify_rk`](super::Spend::verify_rk)), because they consume `fvk`;
+    /// - passed to the Prover, because it requires `fvk`;
+    /// - re-serialized when the `fvk` field must be preserved, because it would be dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_for_signing(
+        nullifier: [u8; 32],
+        rk: [u8; 32],
+        spend_auth_sig: Option<[u8; 64]>,
+        recipient: Option<[u8; 43]>,
+        value: Option<u64>,
+        rho: Option<[u8; 32]>,
+        rseed: Option<[u8; 32]>,
+        fvk: Option<[u8; 96]>,
+        witness: Option<(u32, [[u8; 32]; NOTE_COMMITMENT_TREE_DEPTH])>,
+        alpha: Option<[u8; 32]>,
+        zip32_derivation: Option<Zip32Derivation>,
+        dummy_sk: Option<[u8; 32]>,
+        note_version: NoteVersion,
+        proprietary: BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, ParseError> {
+        Self::parse_inner(
+            nullifier,
+            rk,
+            spend_auth_sig,
+            recipient,
+            value,
+            rho,
+            rseed,
+            fvk,
+            witness,
+            alpha,
+            zip32_derivation,
+            dummy_sk,
+            note_version,
+            proprietary,
+            true,
+        )
+    }
+
+    /// The shared body of [`Spend::parse`] and [`Spend::parse_for_signing`].
+    ///
+    /// When `skip_fvk` is `false` (the full parse), an on-the-wire `fvk` is derived via
+    /// [`FullViewingKey::from_bytes`] exactly as before. When `skip_fvk` is `true` (the
+    /// Signer-only lean parse), the `fvk` bytes are ignored entirely and the parsed
+    /// `fvk` field is left `None`; no FVK derivation is performed. Every other field is
+    /// parsed identically in both modes.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_inner(
+        nullifier: [u8; 32],
+        rk: [u8; 32],
+        spend_auth_sig: Option<[u8; 64]>,
+        recipient: Option<[u8; 43]>,
+        value: Option<u64>,
+        rho: Option<[u8; 32]>,
+        rseed: Option<[u8; 32]>,
+        fvk: Option<[u8; 96]>,
+        witness: Option<(u32, [[u8; 32]; NOTE_COMMITMENT_TREE_DEPTH])>,
+        alpha: Option<[u8; 32]>,
+        zip32_derivation: Option<Zip32Derivation>,
+        dummy_sk: Option<[u8; 32]>,
+        note_version: NoteVersion,
+        proprietary: BTreeMap<String, Vec<u8>>,
+        skip_fvk: bool,
     ) -> Result<Self, ParseError> {
         let nullifier = Nullifier::from_bytes(&nullifier)
             .into_option()
@@ -167,9 +337,17 @@ impl Spend {
             })
             .transpose()?;
 
-        let fvk = fvk
-            .map(|fvk| FullViewingKey::from_bytes(&fvk).ok_or(ParseError::InvalidFullViewingKey))
-            .transpose()?;
+        // The Signer-only lean parse skips the (relatively expensive) FVK derivation: the
+        // signature never depends on `fvk`, and the preceding full Verifier check over the
+        // identical bytes has already derived and validated it. See
+        // [`Spend::parse_for_signing`] for the full invariant. The full parse derives it as
+        // before.
+        let fvk = if skip_fvk {
+            None
+        } else {
+            fvk.map(|fvk| FullViewingKey::from_bytes(&fvk).ok_or(ParseError::InvalidFullViewingKey))
+                .transpose()?
+        };
 
         let witness = witness
             .map(|(position, auth_path)| {
@@ -357,15 +535,6 @@ pub enum ParseError {
     UnexpectedFlagBitsSet,
     /// An invalid `note_version` was provided.
     InvalidNoteVersion,
-    /// A derived field that was omitted from the PCZT could not be recomputed from the
-    /// note's component fields. Wraps the [`VerifyError`](super::VerifyError) describing
-    /// which component was missing or invalid.
-    ///
-    /// Note: there is deliberately no `From<VerifyError> for ParseError` conversion; callers
-    /// wrap explicitly via `ParseError::Recompute`. A blanket `From` would make the `?`
-    /// operator ambiguous in existing parse code (two `impl`s satisfying
-    /// `ParseError: From<_>`).
-    Recompute(super::VerifyError),
 }
 
 impl fmt::Display for ParseError {
@@ -393,9 +562,6 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnexpectedFlagBitsSet => write!(f, "`flags` field had unexpected bits set"),
             ParseError::InvalidNoteVersion => write!(f, "invalid `note_version`"),
-            ParseError::Recompute(e) => {
-                write!(f, "could not recompute an omitted derived field: {e}")
-            }
         }
     }
 }

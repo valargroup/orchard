@@ -842,8 +842,8 @@ mod tests {
         use super::{Action, Spend};
         use rand::{rngs::StdRng, SeedableRng};
 
-        let pool_restrictions = BundlePoolRestrictions::OrchardNu6_2Only;
-        let pk = ProvingKey::build(pool_restrictions.circuit_version());
+        let bundle_version = BundleVersion::orchard_v2();
+        let pk = ProvingKey::build(bundle_version.circuit_version());
         let mut rng = OsRng;
 
         // Derive the spending key material (the seed-derived `ask` the signer uses).
@@ -862,7 +862,7 @@ mod tests {
                     value,
                     rho,
                     RandomSeed::random(&mut rng, &rho),
-                    pool_restrictions.note_version(),
+                    bundle_version.note_version(),
                 )
                 .into_option()
                 {
@@ -896,7 +896,13 @@ mod tests {
         };
 
         // Creator + Constructor.
-        let mut builder = Builder::new(pool_restrictions, BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(
+            BundleType::DEFAULT,
+            bundle_version,
+            bundle_version.default_flags(),
+            anchor,
+        )
+        .unwrap();
         builder
             .add_spend(fvk.clone(), note, merkle_path.into())
             .unwrap();
@@ -935,7 +941,10 @@ mod tests {
             "test precondition: the captured spend must carry an fvk on the wire",
         );
         // Sanity: `alpha` and a real (non-`None`) signature randomizer are present.
-        assert!(spend.alpha().is_some(), "alpha must be set after IO finalize");
+        assert!(
+            spend.alpha().is_some(),
+            "alpha must be set after IO finalize"
+        );
 
         // Raw component bytes (the same encoding `pczt::Bundle::serialize_from` produces).
         let cv_net_bytes: [u8; 32] = action.cv_net().to_bytes();
@@ -1003,10 +1012,7 @@ mod tests {
             alloc::collections::BTreeMap::new(),
         )
         .expect("full spend parse");
-        assert!(
-            full_spend.fvk().is_some(),
-            "full parse must derive the fvk",
-        );
+        assert!(full_spend.fvk().is_some(), "full parse must derive the fvk",);
         let mut full_action =
             Action::parse(cv_net_bytes, full_spend, build_output(), rcv_bytes).unwrap();
 
@@ -1065,10 +1071,7 @@ mod tests {
 
         // And both must verify against `rk` (defends against two matching-but-wrong sigs).
         full_action
-            .apply_signature(
-                sighash,
-                redpallas::Signature::<SpendAuth>::from(lean_sig),
-            )
+            .apply_signature(sighash, redpallas::Signature::<SpendAuth>::from(lean_sig))
             .expect("the lean signature verifies against the full action's rk");
     }
 

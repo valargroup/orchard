@@ -92,13 +92,13 @@ impl Bundle {
     /// The bundle-level fields (`flags`, `value_sum`, `anchor`, `zkproof`, `bsk`) are parsed
     /// identically to [`Bundle::parse`]; the only difference is that each action's spend
     /// omits its [`FullViewingKey`] (see [`Spend::parse_for_signing`] for the invariant).
-    /// The resulting bundle is usable for [`Action::sign`](super::Action::sign) but MUST NOT
+    /// The resulting bundle is usable for [`Action::sign`](super::Action::sign) but must not
     /// be passed to the Verifier check path, the Prover, or any `fvk`-preserving
     /// serialization.
     pub fn parse_for_signing(
         actions: Vec<Action>,
         flags: u8,
-        pool_restrictions: BundlePoolRestrictions,
+        bundle_version: BundleVersion,
         value_sum: (u64, bool),
         anchor: [u8; 32],
         zkproof: Option<Vec<u8>>,
@@ -109,7 +109,7 @@ impl Bundle {
         Self::parse(
             actions,
             flags,
-            pool_restrictions,
+            bundle_version,
             value_sum,
             anchor,
             zkproof,
@@ -158,7 +158,7 @@ impl Action {
     /// documented on [`Spend::parse_for_signing`].
     ///
     /// The resulting [`Action`] is fully usable for signing (its `spend` retains `alpha`,
-    /// `rk`, and the spend-authorizing-key path), but it MUST NOT be passed to the Verifier
+    /// `rk`, and the spend-authorizing-key path), but it must not be passed to the Verifier
     /// check path, the Prover, or any serialization that needs `fvk`.
     pub fn parse_for_signing(
         cv_net: [u8; 32],
@@ -232,10 +232,10 @@ impl Spend {
     /// [`Action::sign`](super::Action::sign) never reads `spend.fvk` (it reads only `alpha`,
     /// `rk`, and the seed-derived `ask`), and because signing always follows a full
     /// pre-swipe Verifier check (`verify_nullifier` / `verify_rk`) performed over the
-    /// identical PCZT bytes, which DOES derive and check the FVK. The signer therefore does
+    /// identical PCZT bytes, which does derive and check the FVK. The signer therefore does
     /// not need to re-derive it.
     ///
-    /// A `Spend` produced by this method MUST NOT be:
+    /// A `Spend` produced by this method must not be:
     /// - passed to the Verifier check path ([`verify_nullifier`](super::Spend::verify_nullifier),
     ///   [`verify_rk`](super::Spend::verify_rk)), because they consume `fvk`;
     /// - passed to the Prover, because it requires `fvk`;

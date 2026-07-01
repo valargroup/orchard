@@ -830,10 +830,10 @@ mod tests {
     /// [`super::Action::parse_for_signing`]) produces a byte-identical `spend_auth_sig` to
     /// the full parse ([`super::Spend::parse`] / [`super::Action::parse`]).
     ///
-    /// We build one real Orchard action through the full role pipeline (Creator,
-    /// Constructor, IO Finalizer, Prover), capture the raw on-the-wire component bytes of
-    /// its spend (including the `fvk`), then re-parse those identical bytes twice: once with
-    /// the full parse (which derives the FVK) and once with the lean parse (which skips it).
+    /// We build one real Orchard action through IO finalization, capture the raw
+    /// on-the-wire component bytes of its spend (including the `fvk`), then re-parse
+    /// those identical bytes twice: once with the full parse (which derives the FVK)
+    /// and once with the lean parse (which skips it).
     /// Signing both with the same `ask`, `sighash`, and an identically-seeded RNG must yield
     /// the same 64-byte signature, because the signature depends only on `alpha`, `rk`, and
     /// `ask`, never on `fvk`.
@@ -843,7 +843,6 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng};
 
         let bundle_version = BundleVersion::orchard_v2();
-        let pk = ProvingKey::build(bundle_version.circuit_version());
         let mut rng = OsRng;
 
         // Derive the spending key material (the seed-derived `ask` the signer uses).
@@ -919,10 +918,9 @@ mod tests {
             .unwrap();
         let (mut pczt_bundle, _meta) = builder.build_for_pczt(&mut rng).unwrap();
 
-        // IO Finalizer (sets `alpha`/`rk` consistency) + Prover.
+        // IO Finalizer sets the `alpha`/`rk` consistency needed for signing.
         let sighash = [0u8; 32];
         pczt_bundle.finalize_io(sighash, rng).unwrap();
-        pczt_bundle.create_proof(&pk, rng).unwrap();
 
         // Find the real spend action (the one whose `ask` we hold) and capture the raw
         // on-the-wire component bytes of its spend. The `fvk` IS present on the wire here,

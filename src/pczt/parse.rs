@@ -230,9 +230,9 @@ impl Spend {
     ///
     /// This lean parse omits FVK derivation. It is only valid because
     /// [`Action::sign`](super::Action::sign) never reads `spend.fvk` (it reads only `alpha`,
-    /// `rk`, and the seed-derived `ask`), and because signing always follows a full
-    /// pre-swipe Verifier check (`verify_nullifier` / `verify_rk`) performed over the
-    /// identical PCZT bytes, which does derive and check the FVK. The signer therefore does
+    /// `rk`, and the seed-derived `ask`), and because callers MUST have already run the
+    /// full Verifier checks (`verify_nullifier` / `verify_rk`) over the identical PCZT
+    /// bytes before signing, which do derive and check the FVK. The signer therefore does
     /// not need to re-derive it.
     ///
     /// A `Spend` produced by this method must not be:

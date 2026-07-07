@@ -24,7 +24,7 @@ mod parse;
 pub use parse::ParseError;
 
 mod verify;
-pub use verify::VerifyError;
+pub use verify::{recompute, VerifyError};
 
 mod io_finalizer;
 pub use io_finalizer::IoFinalizerError;
@@ -1406,7 +1406,10 @@ mod tests {
 
         let bundle_version = BundleVersion::orchard_v3();
         let mut builder = Builder::new(
-            BundleType::DEFAULT,
+            BundleType::Transactional {
+                bundle_required: false,
+                pad_to_minimum: true,
+            },
             bundle_version,
             bundle_version.default_flags(),
             anchor,
